@@ -1,6 +1,6 @@
 import telebot
 from telebot import types
-from curl_cffi import requests # Используем вместо cloudscraper
+from curl_cffi import requests
 from bs4 import BeautifulSoup
 import time
 import threading
@@ -8,9 +8,14 @@ import json
 import os
 import logging
 import random
+from fake_useragent import UserAgent
 
 # ================= КОНФИГ =================
 TOKEN = "8114726970:AAH8PkCdmUCWRipiWLbpteiYjX9Zyleb4FQ"
+
+# СЮДА ВСТАВЛЯТЬ КУКИ ОТ ПУСТОГО АККАУНТА (ТВИНКА), ЕСЛИ БЕЗ НИХ НЕ РАБОТАЕТ
+# Не используй админские куки!
+MY_COOKIE = "" 
 
 URLS = {
     "jb_admins": {
@@ -32,21 +37,17 @@ URLS = {
 }
 
 DB_FILE = "users_v2.json"
-CHECK_INTERVAL = 60  # Проверяем раз в минуту
+CHECK_INTERVAL = 70 
 
-# Настройка логов
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 bot = telebot.TeleBot(TOKEN)
+ua = UserAgent()
 
-# ================= СЕССИЯ С ИМИТАЦИЕЙ БРАУЗЕРА =================
-# curl_cffi позволяет имитировать отпечаток браузера Chrome
-session = requests.Session()
-
-# ================= ПЕРЕМЕННЫЕ ПАМЯТИ =================
+# ================= БД =================
 data_lock = threading.Lock()
-last_scan_info = {key: {"id": None, "title": "Нет данных", "check_time": "Не проверялось"} for key in URLS.keys()}
+# Статус по умолчанию
+last_scan_info = {key: {"id": None, "title": "Запуск...", "check_time": "...", "status": "Wait"} for key in URLS.keys()}
 
-# ================= РАБОТА С БД =================
 def load_db():
     if not os.path.exists(DB_FILE): return {}
     try:
@@ -71,95 +72,89 @@ def toggle_sub(user_id, category):
     save_db(db)
     return res
 
-# ================= ПАРСЕР (НОВЫЙ МЕТОД) =================
+# ================= ПАРСЕР =================
 def parse_forum_category(cat_key):
     url = URLS[cat_key]['url']
+    
+    # Создаем новую сессию для каждого запроса (чтобы менять отпечатки)
+    session = requests.Session()
+    
     try:
         # Случайная задержка
-        time.sleep(random.uniform(1, 3))
+        time.sleep(random.uniform(2, 5))
         
-        # Запрос с имитацией Chrome 110 (обходит TLS Fingerprint)
-        response = session.get(
-            url, 
-            impersonate="chrome110", 
-            timeout=15
-        )
+        headers = {
+            'authority': 'forum.blackrussia.online',
+            'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'accept-language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+            'referer': 'https://forum.blackrussia.online/',
+            'upgrade-insecure-requests': '1',
+            'user-agent': ua.random # Генерируем случайный агент
+        }
         
+        if MY_COOKIE:
+            headers['cookie'] = MY_COOKIE
+
+        # impersonate="chrome110" лучше всего работает сейчас
+        response = session.get(url, headers=headers, impersonate="chrome110", timeout=20)
+        
+        # Проверка на заглушку DDoS-Guard
+        if "ddos-guard" in response.text.lower() or "just a moment" in response.text.lower():
+            return {"error": "⛔ IP в бане (нужны куки)"}
+
         if response.status_code != 200:
-            logging.error(f"FAIL {cat_key}: Code {response.status_code}")
-            return None
+            return {"error": f"HTTP {response.status_code}"}
 
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Находим темы
+        # Ищем темы
         threads = soup.select('.structItem--thread')
         
+        # Если список пуст, возможно, нас перекинуло на страницу входа или ошибки
         if not threads:
-            # Иногда защита выдает заглушку, проверяем это
-            if "Just a moment" in response.text or "DDoS-Guard" in response.text:
-                logging.warning(f"DETECTED PROTECTION on {cat_key}")
-            else:
-                logging.warning(f"Пустой список тем в {cat_key}. Возможно, верстка изменилась.")
-            return None
+            if "Log in" in response.text or "Войти" in response.text:
+                return {"error": "Требует вход (Login)"}
+            return {"error": "Не вижу тем (возможно, верстка)"}
 
         found_thread = None
-        
         for thread in threads:
             classes = thread.get('class', [])
-            
-            # Пропускаем закрепы и удаленные
+            # Пропускаем закрепленные и удаленные
             if 'structItem-status--sticky' in classes or 'is-deleted' in classes:
                 continue
 
             title_tag = thread.select_one('.structItem-title a')
             author_tag = thread.select_one('.username')
-            
-            # Получаем префикс
             prefix_tag = thread.select_one('.label')
-            prefix = prefix_tag.text.strip() if prefix_tag else "Без префикса"
             
             if title_tag:
-                # Дополнительная проверка: иногда форум кидает "Переадресацию" как тему
-                if "redirect" in title_tag['href']:
-                    continue
-
+                # Игнорируем переадресации
+                if "redirect" in title_tag['href']: continue
+                
                 found_thread = {
                     "id": link_to_id(title_tag['href']),
                     "title": title_tag.text.strip(),
                     "link": "https://forum.blackrussia.online" + title_tag['href'],
                     "author": author_tag.text.strip() if author_tag else "Аноним",
-                    "prefix": prefix
+                    "prefix": prefix_tag.text.strip() if prefix_tag else "---"
                 }
                 break 
 
         return found_thread
 
     except Exception as e:
-        logging.error(f"Error parsing {cat_key}: {e}")
-        return None
+        logging.error(f"Err {cat_key}: {e}")
+        return {"error": "Ошибка сети"}
+    finally:
+        session.close()
 
 def link_to_id(link):
-    try:
-        return link.split('.')[-1].replace('/', '')
-    except:
-        return link
+    try: return link.split('.')[-1].replace('/', '')
+    except: return link
 
-# ================= ФОНОВЫЙ ПРОЦЕСС =================
+# ================= MONITOR LOOP =================
 def monitor_loop():
-    logging.info("🚀 Мониторинг запущен (CURL_CFFI mode)")
-    
-    # Первый прогон
-    for key in URLS:
-        data = parse_forum_category(key)
-        if data:
-            last_scan_info[key] = {
-                "id": data['id'],
-                "title": data['title'],
-                "check_time": time.strftime("%H:%M:%S")
-            }
-            logging.info(f"Init {key}: {data['title']}")
-        else:
-             logging.info(f"Init {key}: Не удалось получить данные")
+    logging.info("🚀 STARTING MONITORING...")
     
     while True:
         try:
@@ -167,92 +162,114 @@ def monitor_loop():
             
             for key, info in URLS.items():
                 data = parse_forum_category(key)
-                current_time = time.strftime("%H:%M:%S")
+                cur_time = time.strftime("%H:%M:%S")
                 
+                # Если вернулась ошибка
+                if data and "error" in data:
+                    last_scan_info[key] = {
+                        "status": "ERROR", 
+                        "check_time": cur_time, 
+                        "title": data['error'], 
+                        "id": None
+                    }
+                    continue
+                
+                # Если данные есть
                 if data:
                     prev_id = last_scan_info[key].get('id')
                     
                     last_scan_info[key] = {
+                        "status": "OK",
                         "id": data['id'],
                         "title": data['title'],
-                        "check_time": current_time
+                        "check_time": cur_time
                     }
                     
+                    # Если ID изменился - шлем уведомление
                     if prev_id and data['id'] != prev_id:
-                        logging.info(f"🔥 NEW THREAD in {key}: {data['title']}")
-                        
                         msg = (
-                            f"🔥 <b>НОВАЯ ЖАЛОБА</b>\n"
+                            f"🔥 <b>НОВАЯ ТЕМА</b>\n"
                             f"📂 {info['name']}\n"
                             f"🏷 <b>{data['prefix']}</b>\n"
-                            f"👤 От: {data['author']}\n\n"
-                            f"📝 <a href='{data['link']}'>{data['title']}</a>"
+                            f"👤 {data['author']}\n\n"
+                            f"👉 <a href='{data['link']}'>{data['title']}</a>"
                         )
-                        
-                        for user_id, subs in db.items():
+                        for uid, subs in db.items():
                             if key in subs:
-                                try:
-                                    bot.send_message(user_id, msg, parse_mode='HTML')
+                                try: bot.send_message(uid, msg, parse_mode='HTML')
                                 except: pass
                 else:
-                    last_scan_info[key]['check_time'] = f"{current_time} (Защита/Ошибка)"
+                    # Если просто вернулось None (пусто)
+                    last_scan_info[key] = {
+                        "status": "WARN",
+                        "check_time": cur_time,
+                        "title": "Пусто/Сбой",
+                        "id": last_scan_info[key].get('id')
+                    }
 
             time.sleep(CHECK_INTERVAL)
-            
         except Exception as e:
-            logging.error(f"Global Loop Error: {e}")
+            logging.error(f"Loop error: {e}")
             time.sleep(60)
 
-# ================= МЕНЮ =================
+# ================= MENU =================
 def main_menu(user_id):
     markup = types.InlineKeyboardMarkup(row_width=1)
     subs = get_user_subs(user_id)
     
     for key, data in URLS.items():
         status = "✅" if key in subs else "❌"
-        markup.add(types.InlineKeyboardButton(f"{status} {data['name']}", callback_data=f"sub_{key}"))
+        # ИСПРАВЛЕНА ОШИБКА: теперь callback однозначный
+        markup.add(types.InlineKeyboardButton(f"{status} {data['name']}", callback_data=f"sub:{key}"))
     
-    markup.add(types.InlineKeyboardButton("📊 Статус / Логи бота", callback_data="check_logs"))
+    markup.add(types.InlineKeyboardButton("📊 Статус бота", callback_data="check_logs"))
     return markup
-
-@bot.message_handler(commands=['start'])
-def start_h(m):
-    bot.send_message(
-        m.chat.id, 
-        "🤖 <b>Мониторинг BlackRussia</b>\nЖми кнопки для подписки на разделы.",
-        reply_markup=main_menu(m.chat.id),
-        parse_mode='HTML'
-    )
 
 def get_user_subs(uid):
     db = load_db()
     return db.get(str(uid), [])
 
+@bot.message_handler(commands=['start'])
+def start_h(m):
+    bot.send_message(m.chat.id, "👋 Меню мониторинга:", reply_markup=main_menu(m.chat.id))
+
 @bot.callback_query_handler(func=lambda call: True)
 def callback_h(call):
     if call.data == "check_logs":
-        report = "📊 <b>ТЕКУЩИЙ СТАТУС БОТА:</b>\n\n"
-        for key, info in last_scan_info.items():
-            name = URLS[key]['name']
-            last_t = info['title']
-            check_t = info['check_time']
-            if len(last_t) > 25: last_t = last_t[:25] + "..."
-            
-            report += f"🔹 <b>{name}</b>\n🕒 {check_t}\n👁 {last_t}\n\n"
+        report = "📊 <b>СТАТУС:</b>\n\n"
         
+        for key, info in last_scan_info.items():
+            st = info.get('status', 'Wait')
+            if st == "OK": icon = "🟢"
+            elif st == "ERROR": icon = "🔴"
+            else: icon = "🟡"
+            
+            title = info.get('title', '...')
+            if len(title) > 30: title = title[:30] + "..."
+            
+            report += f"{icon} <b>{URLS[key]['name']}</b>\n🕒 {info['check_time']}\nℹ️ {title}\n\n"
+        
+        if not MY_COOKIE:
+            report += "⚠️ <i>Работа без куки (возможны сбои)</i>"
+            
         bot.send_message(call.message.chat.id, report, parse_mode='HTML')
         bot.answer_callback_query(call.id)
         
-    elif call.data.startswith("sub_"):
-        key = call.data.split("_")[1]
-        toggle_sub(call.message.chat.id, key)
-        try:
-            bot.edit_message_reply_markup(
-                call.message.chat.id, 
-                call.message.message_id, 
-                reply_markup=main_menu(call.message.chat.id)
-            )
-        except: pass
+    elif call.data.startswith("sub:"):
+        # ИСПРАВЛЕНА ЛОГИКА ОБРАБОТКИ
+        key = call.data.split(":")[1]
+        
+        if key in URLS:
+            toggle_sub(call.message.chat.id, key)
+            try:
+                bot.edit_message_reply_markup(
+                    call.message.chat.id, 
+                    call.message.message_id, 
+                    reply_markup=main_menu(call.message.chat.id)
+                )
+            except: pass
+        else:
+            bot.answer_callback_query(call.id, "Раздел не найден")
 
 if __name__ == "__main__":
     t = threading.Thread(target=monitor_loop, daemon=True)
