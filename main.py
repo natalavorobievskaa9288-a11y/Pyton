@@ -4,121 +4,227 @@ import yt_dlp
 import logging
 import threading
 import time
-from urllib.parse import quote
+import os
+import shutil
 
 # ================= КОНФИГ =================
 TOKEN = "8342888953:AAFSTtk4Bj527mxjljOr4jvGYjZ6NHq2v6M"
+BOT_USERNAME = "ТвойБот" # Поменяй на имя
 
-# Зеркало для обхода замедления (Invidious)
-# yewtu.be - одно из самых стабильных
-BYPASS_URL = "https://yewtu.be/watch?v=" 
+# Папка для временных файлов (для 1080p)
+DOWNLOAD_PATH = "temp_downloads"
+if os.path.exists(DOWNLOAD_PATH): shutil.rmtree(DOWNLOAD_PATH)
+os.makedirs(DOWNLOAD_PATH)
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(level=logging.INFO)
 bot = telebot.TeleBot(TOKEN)
 
-# ================= ПРИВЕТСТВИЕ =================
-@bot.message_handler(commands=['start'])
-def start(message):
-    markup = types.InlineKeyboardMarkup()
-    # Кнопка для теста WebApp
-    web_btn = types.InlineKeyboardButton("📺 Тест обхода (WebApp)", web_app=types.WebAppInfo("https://yewtu.be"))
-    markup.add(web_btn)
+# Память для хранения инфы о видео (чтобы не парсить дважды)
+# {chat_id: {info_dict}}
+users_cache = {}
+
+# ================= ГЕНЕРАЦИЯ МЕНЮ (КАК НА СКРИНЕ) =================
+def format_size(bytes_size):
+    if not bytes_size: return "N/A"
+    mb = bytes_size / (1024 * 1024)
+    return f"{round(mb, 1)} MB"
+
+def create_quality_keyboard(formats, chat_id, video_id):
+    markup = types.InlineKeyboardMarkup(row_width=3)
     
-    bot.send_message(
-        message.chat.id,
-        "🇷🇺 <b>СИСТЕМА ЗАГРУЗКИ v3.0 (TURBO)</b>\n\n"
-        "Я работаю по протоколу <b>Direct Stream</b>.\n"
-        "Я не качаю файлы на диск — я заставляю Телеграм качать их напрямую.\n\n"
-        "⚡ <b>Кидай ссылку на:</b>\n"
-        "🔴 YouTube (Video/Shorts)\n"
-        "⚫ TikTok\n"
-        "🟣 Instagram Reels\n\n"
-        "👇 <i>Жду ссылку...</i>",
-        parse_mode='HTML',
-        reply_markup=markup
-    )
+    # Сортируем форматы
+    # Нам нужны: audio, 144, 240, 360, 480, 720, 1080
+    available_buttons = []
+    
+    # 1. Аудио (MP3)
+    markup.add(types.InlineKeyboardButton(f"🎵 MP3", callback_data=f"dl_audio"))
 
-# ================= ОБРАБОТКА ССЫЛОК =================
-def process_video(url, chat_id, message_id):
+    # 2. Видео
+    # Собираем уникальные качества
+    seen_heights = set()
+    buttons_row = []
+    
+    for f in formats:
+        h = f.get('height')
+        if not h or h in seen_heights: continue
+        
+        filesize = f.get('filesize') or f.get('filesize_approx')
+        size_str = format_size(filesize)
+        
+        # ЛОГИКА РАКЕТЫ:
+        # Если есть прямая ссылка и файл есть видео+звук (acodec != none) -> Ракета 🚀
+        # Если нужно клеить ffmpeg -> Дискетка 💾
+        icon = "🚀" if f.get('acodec') != 'none' and f.get('vcodec') != 'none' else "📥"
+        if f.get('ext') != 'mp4': continue # Берем только mp4 для простоты
+        
+        btn_text = f"{icon} {h}p ({size_str})"
+        callback = f"dl_video_{f['format_id']}"
+        
+        buttons_row.append(types.InlineKeyboardButton(btn_text, callback_data=callback))
+        seen_heights.add(h)
+        
+        # Ограничим до 1080p (выше телеграм не переварит обычно)
+        if h >= 1080: break
+
+    # Добавляем кнопки рядами по 2 или 3
+    markup.add(*buttons_row)
+    
+    # Кнопка WebApp
+    markup.add(types.InlineKeyboardButton("📺 Смотреть онлайн (Без скачивания)", web_app=types.WebAppInfo(f"https://yewtu.be/watch?v={video_id}")))
+    
+    return markup
+
+# ================= АНАЛИЗ ССЫЛКИ =================
+def process_url(url, chat_id, message_id):
     try:
-        # Настройки: НЕ качать, только получить JSON
         ydl_opts = {
-            'format': 'best[ext=mp4]/best', # Ищем лучшее mp4
-            'noplaylist': True,
             'quiet': True,
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36',
+            'no_warnings': True,
+            'noplaylist': True,
         }
-
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # 1. Получаем инфу МГНОВЕННО (без скачивания)
+            # ПОЛУЧАЕМ ТОЛЬКО JSON (ЭТО БЫСТРО, 1-2 сек)
             info = ydl.extract_info(url, download=False)
             
-            video_url = info.get('url', None) # Прямая ссылка на файл
+            # Сохраняем в кэш
+            users_cache[chat_id] = info
+            
             title = info.get('title', 'Video')
             author = info.get('uploader', 'Unknown')
-            video_id = info.get('id', '')
-            duration = info.get('duration', 0)
+            thumb = info.get('thumbnail', None)
+            formats = info.get('formats', [])
+            video_id = info.get('id')
             
-            # Формируем кнопку для просмотра без замедления
-            markup = types.InlineKeyboardMarkup()
-            
-            # Генерируем ссылку для WebApp (обход РКН через Invidious)
-            if video_id:
-                watch_url = f"{BYPASS_URL}{video_id}"
-                btn_watch = types.InlineKeyboardButton(
-                    text="📺 Смотреть онлайн (Без лагов)", 
-                    web_app=types.WebAppInfo(watch_url)
-                )
-                markup.add(btn_watch)
-            
-            # Подпись
-            caption = f"🎬 <b>{title}</b>\n👤 {author}\n⏱ {time.strftime('%M:%S', time.gmtime(duration))}"
-
-            # 2. Пытаемся отправить ПРЯМУЮ ССЫЛКУ (Метод Instant)
-            # Телеграм сам скачает видео по ссылке video_url
-            if video_url:
-                try:
-                    bot.send_video(
-                        chat_id, 
-                        video=video_url, 
-                        caption=caption, 
-                        parse_mode='HTML',
-                        reply_markup=markup,
-                        supports_streaming=True
-                    )
-                    # Удаляем сообщение "Загрузка"
-                    bot.delete_message(chat_id, message_id)
-                    logging.info(f"Sent via URL: {url}")
-                    return
-                except Exception as e:
-                    logging.error(f"Telegram refused direct URL: {e}")
-                    # Если Телеграм не принял ссылку (бывает с YouTube), идем дальше
-            
-            # Если прямая ссылка не сработала (YouTube часто блокирует чужие IP)
-            bot.edit_message_text(
-                chat_id=chat_id, 
-                message_id=message_id, 
-                text="⚠️ <b>Прямая ссылка недоступна.</b>\nYouTube блокирует отправку файлом.\n\n👇 <b>Нажми кнопку ниже, чтобы смотреть без замедления:</b>",
-                reply_markup=markup,
-                parse_mode='HTML'
+            # Формируем текст сообщения (как на скрине)
+            msg_text = (
+                f"🎬 <b>{title}</b>\n"
+                f"👤 {author}\n\n"
+                f"✅ <b>Видео найдено!</b>\n"
+                f"Выберите качество ниже:\n"
+                f"🚀 — Моментальная отправка\n"
+                f"📥 — Скачивание на сервер (дольше)"
             )
+            
+            markup = create_quality_keyboard(formats, chat_id, video_id)
+            
+            # Если есть картинка - шлем с картинкой, иначе текст
+            bot.delete_message(chat_id, message_id)
+            if thumb:
+                bot.send_photo(chat_id, thumb, caption=msg_text, reply_markup=markup, parse_mode='HTML')
+            else:
+                bot.send_message(chat_id, msg_text, reply_markup=markup, parse_mode='HTML')
 
     except Exception as e:
-        bot.edit_message_text(chat_id, message_id, text=f"❌ Ошибка: {str(e)}")
+        bot.edit_message_text(f"❌ Ошибка: {str(e)}", chat_id, message_id)
 
-@bot.message_handler(content_types=['text'])
-def handle_url(message):
-    url = message.text.strip()
-    
-    if not ("http" in url): 
+# ================= СКАЧИВАНИЕ =================
+@bot.callback_query_handler(func=lambda call: True)
+def handle_query(call):
+    chat_id = call.message.chat.id
+    if chat_id not in users_cache:
+        bot.answer_callback_query(call.id, "❌ Данные устарели, отправь ссылку снова")
         return
 
-    # Моментальный ответ
-    msg = bot.send_message(message.chat.id, "⚡ <b>Обработка запроса...</b>", parse_mode='HTML')
+    info = users_cache[chat_id]
+    url = info.get('webpage_url')
     
-    # Запускаем в фоне
-    threading.Thread(target=process_video, args=(url, message.chat.id, msg.message_id)).start()
+    # 1. ОБРАБОТКА АУДИО
+    if call.data == "dl_audio":
+        bot.answer_callback_query(call.id, "🎵 Качаю аудио...")
+        msg = bot.send_message(chat_id, "🎵 <b>Загрузка аудио...</b>", parse_mode='HTML')
+        threading.Thread(target=download_audio, args=(url, chat_id, msg.message_id)).start()
+        return
 
-# ================= ЗАПУСК =================
+    # 2. ОБРАБОТКА ВИДЕО
+    if call.data.startswith("dl_video_"):
+        format_id = call.data.split("_")[2]
+        
+        # Ищем выбранный формат в кэше
+        selected_format = next((f for f in info['formats'] if f['format_id'] == format_id), None)
+        
+        if not selected_format:
+            bot.answer_callback_query(call.id, "Ошибка формата")
+            return
+
+        # ПРОВЕРКА НА МОМЕНТАЛЬНОСТЬ (ROCKET)
+        # Если есть url и размер < 50мб, пробуем кинуть ссылкой
+        direct_url = selected_format.get('url')
+        filesize = selected_format.get('filesize') or 0
+        
+        is_rocket = (selected_format.get('acodec') != 'none') # Есть звук
+        
+        if is_rocket and filesize < 50*1024*1024:
+            bot.answer_callback_query(call.id, "🚀 Отправляю моментально...")
+            try:
+                bot.send_video(chat_id, direct_url, caption=f"🎬 {info['title']}", supports_streaming=True)
+                return
+            except:
+                # Если телеграм отверг ссылку, переходим к скачиванию
+                pass
+
+        # Если не вышло моментально - качаем
+        bot.answer_callback_query(call.id, "📥 Скачиваю на сервер...")
+        msg = bot.send_message(chat_id, f"📥 <b>Скачиваю {selected_format.get('height')}p...</b>\n<i>Это может занять время на Bothost</i>", parse_mode='HTML')
+        threading.Thread(target=download_full, args=(url, format_id, chat_id, msg.message_id)).start()
+
+# --- ФУНКЦИЯ ФИЗИЧЕСКОГО СКАЧИВАНИЯ ---
+def download_full(url, format_id, chat_id, message_id):
+    try:
+        filename = f"{DOWNLOAD_PATH}/{chat_id}_{format_id}.mp4"
+        
+        ydl_opts = {
+            'format': f"{format_id}+bestaudio/best", # Склеить видео+звук
+            'outtmpl': filename,
+            'noplaylist': True,
+            'max_filesize': 50*1024*1024
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+            
+        if os.path.exists(filename):
+            bot.edit_message_text("📤 Загружаю в Telegram...", chat_id, message_id)
+            with open(filename, 'rb') as f:
+                bot.send_video(chat_id, f, caption="✅ Готово")
+            bot.delete_message(chat_id, message_id)
+            os.remove(filename)
+        else:
+            bot.edit_message_text("❌ Не удалось скачать (возможно, лимит размера)", chat_id, message_id)
+            
+    except Exception as e:
+        bot.edit_message_text(f"❌ Ошибка: {str(e)}", chat_id, message_id)
+        # Чистка
+        if os.path.exists(filename): os.remove(filename)
+
+# --- ФУНКЦИЯ АУДИО ---
+def download_audio(url, chat_id, message_id):
+    try:
+        filename = f"{DOWNLOAD_PATH}/{chat_id}.mp3"
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': filename,
+            'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}],
+            'max_filesize': 50*1024*1024
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+            
+        if os.path.exists(filename):
+            bot.edit_message_text("📤 Отправляю...", chat_id, message_id)
+            with open(filename, 'rb') as f:
+                bot.send_audio(chat_id, f)
+            bot.delete_message(chat_id, message_id)
+            os.remove(filename)
+    except Exception as e:
+        bot.edit_message_text("❌ Ошибка аудио", chat_id, message_id)
+
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+    url = message.text.strip()
+    if "http" in url:
+        msg = bot.send_message(message.chat.id, "🔎 <b>Анализирую форматы...</b>", parse_mode='HTML')
+        threading.Thread(target=process_url, args=(url, message.chat.id, msg.message_id)).start()
+
 if __name__ == "__main__":
     bot.infinity_polling()
