@@ -1,190 +1,250 @@
 import telebot
 from telebot import types
-from PIL import Image, ImageEnhance, ImageFilter, ImageDraw, ImageFont
-import wikipedia
+import cloudscraper
+from bs4 import BeautifulSoup
+import time
+import threading
+import json
 import os
+import logging
+
+# ================= НАСТРОЙКИ =================
 
 # Твой токен
 TOKEN = "8114726970:AAH8PkCdmUCWRipiWLbpteiYjX9Zyleb4FQ"
 
+# Твои ссылки (уже вставлены)
+URLS = {
+    "jb_admins": {
+        "name": "👮‍♂️ Жалобы на Администрацию",
+        "url": "https://forum.blackrussia.online/forums/Жалобы-на-администрацию.2330/"
+    },
+    "jb_leaders": {
+        "name": "😎 Жалобы на Лидеров",
+        "url": "https://forum.blackrussia.online/forums/Жалобы-на-лидеров.2331/"
+    },
+    "jb_players": {
+        "name": "🎮 Жалобы на Игроков",
+        "url": "https://forum.blackrussia.online/forums/Жалобы-на-игроков.2332/"
+    },
+    "appeals": {
+        "name": "⚖️ Обжалование наказаний",
+        "url": "https://forum.blackrussia.online/forums/Обжалование-наказаний.2333/"
+    }
+}
+
+# Файл базы данных
+DB_FILE = "users_db.json"
+# Время между проверками (в секундах). 60-120 сек оптимально.
+CHECK_INTERVAL = 90
+
+# Настройка бота и логов
 bot = telebot.TeleBot(TOKEN)
-wikipedia.set_lang("ru")  # Википедия на русском
+logging.basicConfig(level=logging.INFO)
 
-# Словарь для хранения состояний пользователей
-user_states = {}
-user_photos = {}
+# Создаем "умный" браузер
+scraper = cloudscraper.create_scraper(
+    browser={
+        'browser': 'chrome',
+        'platform': 'windows',
+        'desktop': True
+    }
+)
 
-# --- ГЛАВНОЕ МЕНЮ ---
-@bot.message_handler(commands=['start'])
-def start(message):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    btn1 = types.KeyboardButton("🧠 Найти в Википедии")
-    btn2 = types.KeyboardButton("📸 Обработать фото")
-    markup.add(btn1, btn2)
+# Глобальные переменные
+data_lock = threading.Lock()
+# Сюда будем запоминать ID последней темы
+last_known_threads = {key: None for key in URLS.keys()}
+
+# ================= РАБОТА С БАЗОЙ ДАННЫХ =================
+def load_db():
+    if not os.path.exists(DB_FILE):
+        return {}
+    try:
+        with open(DB_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_db(data):
+    with data_lock:
+        with open(DB_FILE, 'w') as f:
+            json.dump(data, f)
+
+def get_user_subs(user_id):
+    db = load_db()
+    return db.get(str(user_id), [])
+
+def toggle_sub(user_id, category):
+    db = load_db()
+    s_id = str(user_id)
+    if s_id not in db:
+        db[s_id] = []
     
+    if category in db[s_id]:
+        db[s_id].remove(category)
+        res = False # Отписался
+    else:
+        db[s_id].append(category)
+        res = True # Подписался
+    save_db(db)
+    return res
+
+# ================= ПАРСЕР ФОРУМА =================
+def check_forum_update(category_key):
+    url = URLS[category_key]['url']
+    try:
+        # Запрос через CloudScraper
+        response = scraper.get(url)
+        
+        if response.status_code != 200:
+            logging.error(f"Ошибка доступа к {category_key}: {response.status_code}")
+            return None
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Ищем все темы на странице
+        threads = soup.select('.structItem--thread')
+        
+        for thread in threads:
+            # Пропускаем закрепленные темы (Важно, Правила и т.д.)
+            classes = thread.get('class', [])
+            if 'structItem-status--sticky' in classes:
+                continue
+            
+            # Ищем заголовок
+            title_tag = thread.select_one('.structItem-title a')
+            if not title_tag:
+                continue
+
+            title = title_tag.text.strip()
+            link = "https://forum.blackrussia.online" + title_tag['href']
+            
+            # Получаем ID темы из ссылки (цифры в конце)
+            # Пример: .../zhaloba.12345/ -> 12345
+            try:
+                thread_id = link.split('.')[-1].replace('/', '')
+            except:
+                thread_id = link # Если не вышло, берем всю ссылку как ID
+            
+            # Автор темы
+            author_tag = thread.select_one('.username')
+            author = author_tag.text.strip() if author_tag else "Аноним"
+
+            return {
+                "id": thread_id,
+                "title": title,
+                "link": link,
+                "author": author
+            }
+        return None
+    except Exception as e:
+        logging.error(f"Ошибка парсинга {category_key}: {e}")
+        return None
+
+# ================= ФОНОВАЯ ПРОВЕРКА =================
+def monitor_loop():
+    logging.info("Мониторинг форума запущен...")
+    
+    # Сначала делаем "холостой" проход, чтобы запомнить текущие последние темы
+    # и не спамить при запуске бота старыми темами.
+    logging.info("Инициализация данных...")
+    for cat_key in URLS:
+        latest = check_forum_update(cat_key)
+        if latest:
+            last_known_threads[cat_key] = latest['id']
+    
+    while True:
+        try:
+            db = load_db()
+            
+            for cat_key, cat_data in URLS.items():
+                latest = check_forum_update(cat_key)
+                
+                if latest:
+                    # Если ID сохранен и он отличается от полученного -> НОВАЯ ТЕМА
+                    if last_known_threads[cat_key] is not None and latest['id'] != last_known_threads[cat_key]:
+                        
+                        logging.info(f"Новая тема в {cat_key}: {latest['title']}")
+                        last_known_threads[cat_key] = latest['id']
+                        
+                        # Красивое сообщение
+                        msg = (
+                            f"🔔 <b>НОВАЯ ЖАЛОБА!</b>\n"
+                            f"📂 Раздел: {cat_data['name']}\n"
+                            f"👤 Автор: <code>{latest['author']}</code>\n\n"
+                            f"📝 <b>{latest['title']}</b>\n"
+                            f"🔗 <a href='{latest['link']}'>ПЕРЕЙТИ К ТЕМЕ</a>"
+                        )
+                        
+                        # Рассылка
+                        for user_id, subs in db.items():
+                            if cat_key in subs:
+                                try:
+                                    bot.send_message(user_id, msg, parse_mode='HTML')
+                                except Exception as e:
+                                    logging.error(f"Не удалось отправить юзеру {user_id}: {e}")
+                    
+                    # Если база была пуста (первый запуск), просто обновляем
+                    elif last_known_threads[cat_key] is None:
+                        last_known_threads[cat_key] = latest['id']
+            
+            time.sleep(CHECK_INTERVAL)
+            
+        except Exception as e:
+            logging.error(f"Ошибка в цикле мониторинга: {e}")
+            time.sleep(60)
+
+# ================= МЕНЮ БОТА =================
+def get_keyboard(user_id):
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    subs = get_user_subs(user_id)
+    
+    for key, data in URLS.items():
+        # Ставим галочку или крестик
+        status = "✅" if key in subs else "❌"
+        btn_text = f"{status} {data['name']}"
+        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"sub_{key}"))
+        
+    return markup
+
+@bot.message_handler(commands=['start'])
+def start_cmd(message):
     bot.send_message(
         message.chat.id,
-        f"Привет, {message.from_user.first_name}! 🚀\n\n"
-        "Я стал умнее. Что будем делать?\n"
-        "1. Отправь мне **Фото**, чтобы улучшить его или сделать мем.\n"
-        "2. Напиши любой **Текст**, чтобы я нашел это в Википедии.",
-        reply_markup=markup
+        "👋 <b>Привет! Я бот-мониторинг форума.</b>\n\n"
+        "Я буду присылать уведомления о новых жалобах.\n"
+        "Нажми на кнопки ниже, чтобы подписаться на разделы:",
+        reply_markup=get_keyboard(message.chat.id),
+        parse_mode='HTML'
     )
 
-# --- ЛОГИКА ВИКИПЕДИИ ---
-@bot.message_handler(func=lambda message: not message.photo)
-def wiki_search(message):
-    # Если нажали кнопки меню, просто игнорируем или даем подсказку
-    if message.text == "🧠 Найти в Википедии":
-        bot.send_message(message.chat.id, "Просто напиши мне слово или фразу!")
-        return
-    elif message.text == "📸 Обработать фото":
-        bot.send_message(message.chat.id, "Просто отправь мне фотографию!")
-        return
-
-    # Ищем в вики
-    try:
-        msg = bot.send_message(message.chat.id, "🔍 Ищу информацию...")
-        page = wikipedia.page(message.text)
-        text = page.summary[:800] + "..." # Берем первые 800 символов
-        
-        markup = types.InlineKeyboardMarkup()
-        btn = types.InlineKeyboardButton("Читать полностью", url=page.url)
-        markup.add(btn)
-        
-        bot.edit_message_text(f"📚 **{page.title}**\n\n{text}", chat_id=message.chat.id, message_id=msg.message_id, reply_markup=markup, parse_mode="Markdown")
-    except wikipedia.exceptions.DisambiguationError as e:
-        bot.send_message(message.chat.id, "Слишком много значений. Уточните запрос.")
-    except Exception:
-        bot.send_message(message.chat.id, "Ничего не нашел по этому запросу 😔")
-
-# --- ОБРАБОТКА ФОТО ---
-@bot.message_handler(content_types=['photo'])
-def handle_photo(message):
-    # Скачиваем фото
-    file_info = bot.get_file(message.photo[-1].file_id)
-    downloaded_file = bot.download_file(file_info.file_path)
+@bot.callback_query_handler(func=lambda call: call.data.startswith('sub_'))
+def callback_sub(call):
+    key = call.data.split('_', 1)[1] # Берем все после sub_
+    user_id = call.message.chat.id
     
-    # Сохраняем временно
-    file_name = f"photo_{message.chat.id}.jpg"
-    with open(file_name, 'wb') as new_file:
-        new_file.write(downloaded_file)
-    
-    user_photos[message.chat.id] = file_name
-
-    # Клавиатура выбора действия
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    btn1 = types.InlineKeyboardButton("✨ Улучшить качество", callback_data="enhance")
-    btn2 = types.InlineKeyboardButton("⚫ Ч/Б фильтр", callback_data="bw")
-    btn3 = types.InlineKeyboardButton("✏️ Контуры (Рисунок)", callback_data="contour")
-    btn4 = types.InlineKeyboardButton("💬 Сделать Мем", callback_data="meme")
-    markup.add(btn1, btn2, btn3, btn4)
-
-    bot.reply_to(message, "Фото получено! Что сделаем?", reply_markup=markup)
-
-# --- ОБРАБОТЧИК КНОПОК ---
-@bot.callback_query_handler(func=lambda call: True)
-def callback_query(call):
-    chat_id = call.message.chat.id
-    
-    if chat_id not in user_photos:
-        bot.answer_callback_query(call.id, "Фото устарело, скинь новое!")
-        return
-
-    file_name = user_photos[chat_id]
-    img = Image.open(file_name)
-    bot.answer_callback_query(call.id, "Обрабатываю... ⏳")
-
-    try:
-        if call.data == "enhance":
-            # Улучшаем резкость, цвет и контраст
-            enhancer = ImageEnhance.Sharpness(img)
-            img = enhancer.enhance(1.5) # Резкость
-            enhancer = ImageEnhance.Color(img)
-            img = enhancer.enhance(1.2) # Насыщенность
-            enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(1.1) # Контраст
-            caption = "✨ Фото улучшено!"
-
-        elif call.data == "bw":
-            img = img.convert("L") # Черно-белое
-            caption = "⚫ Ч/Б фильтр применен."
-
-        elif call.data == "contour":
-            img = img.filter(ImageFilter.CONTOUR)
-            caption = "✏️ Эффект контуров."
-
-        elif call.data == "meme":
-            bot.send_message(chat_id, "Напиши текст, который нужно добавить на фото:")
-            user_states[chat_id] = "waiting_for_meme_text"
-            return # Выходим, ждем текст
-
-        # Отправка результата (если это не мем)
-        output_name = f"edited_{chat_id}.jpg"
-        img.save(output_name)
+    if key in URLS:
+        is_subbed = toggle_sub(user_id, key)
         
-        with open(output_name, 'rb') as f:
-            bot.send_photo(chat_id, f, caption=caption)
-        
-        # Чистим мусор
-        os.remove(output_name)
-
-    except Exception as e:
-        bot.send_message(chat_id, f"Ошибка обработки: {e}")
-
-# --- ГЕНЕРАЦИЯ МЕМА (Наложение текста) ---
-@bot.message_handler(func=lambda message: user_states.get(message.chat.id) == "waiting_for_meme_text")
-def add_text_to_photo(message):
-    chat_id = message.chat.id
-    text = message.text
-    file_name = user_photos.get(chat_id)
-
-    if not file_name:
-        bot.send_message(chat_id, "Сначала скинь фото!")
-        return
-
-    try:
-        img = Image.open(file_name)
-        width, height = img.size
-        draw = ImageDraw.Draw(img)
-
-        # Пытаемся подобрать размер шрифта (5% от высоты фото)
-        fontsize = int(height * 0.05)
-        # Используем стандартный шрифт (так как на сервере может не быть крутых)
+        # Обновляем кнопки без лишних сообщений
         try:
-            font = ImageFont.truetype("arial.ttf", fontsize)
+            bot.edit_message_reply_markup(
+                chat_id=user_id,
+                message_id=call.message.message_id,
+                reply_markup=get_keyboard(user_id)
+            )
+            # Всплывающее уведомление
+            text = "Подписка оформлена!" if is_subbed else "Подписка отменена!"
+            bot.answer_callback_query(call.id, text)
         except:
-            font = ImageFont.load_default() # Если нет шрифтов, берем системный
+            pass
 
-        # Рисуем текст внизу
-        # Координаты (немного отступаем снизу)
-        text_position = (10, height - fontsize - 20)
-        
-        # Рисуем черную обводку для читаемости
-        draw.text((text_position[0]-2, text_position[1]-2), text, font=font, fill="black")
-        draw.text((text_position[0]+2, text_position[1]-2), text, font=font, fill="black")
-        
-        # Рисуем белый текст
-        draw.text(text_position, text, font=font, fill="white")
-
-        output_name = f"meme_{chat_id}.jpg"
-        img.save(output_name)
-
-        with open(output_name, 'rb') as f:
-            bot.send_photo(chat_id, f, caption="Твой мем готов! 😎")
-        
-        os.remove(output_name)
-        user_states[chat_id] = None # Сбрасываем состояние
-
-    except Exception as e:
-        bot.send_message(chat_id, f"Не удалось нарисовать текст: {e}")
-
-# Запуск
-if __name__ == '__main__':
-    # Очистка старых фото при перезапуске (опционально)
-    for f in os.listdir():
-        if f.startswith("photo_") or f.startswith("edited_") or f.startswith("meme_"):
-            try: os.remove(f)
-            except: pass
-            
-    bot.infinity_polling(none_stop=True)
+# ================= ЗАПУСК =================
+if __name__ == "__main__":
+    # Запускаем мониторинг в отдельном потоке
+    t = threading.Thread(target=monitor_loop, daemon=True)
+    t.start()
+    
+    print("Бот запущен!")
+    bot.infinity_polling()
