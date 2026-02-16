@@ -9,283 +9,217 @@ import time
 
 # ================= КОНФИГУРАЦИЯ =================
 CONFIG = {
-    # Твой токен:
     "token": "vk1.a.Z9pCqT1rlC8JsFxbrZMhhmvbPe764cfFlF9N1z5RG4nrLfO9E8YisGaABMzphZNjMOZ01Y4A25SAdRZnvVSO2mxmOUq2AiOsPkNmmQXH_6ghpstHBPiPjxZv-c6t8JL8JV1qbmOpFPTTSOx8_CAfsKFaMqa9_-BXqLW4LbeR2fyyncJMlHHpTsfcjLWXtZYJu1rJSUDPp4zoCoVcOpaE5A",
-    
-    # ID ТВОЕЙ ГРУППЫ:
     "group_id": 236066012,
-    
-    # Твой ID (Куда будут приходить отчеты):
     "owner_id": 864765284,
-    
     "db_file": "server_bot.db"
 }
 
-# ================= ШАБЛОНЫ СООБЩЕНИЙ =================
-TEMPLATE_NORMA = """Скопируй шаблон ниже, заполни и отправь:
-
-1 - NickName:
-2 - Уровень администратора:
-3 - Должность:
-4 - Дата отчёта:
-5 - /astats:"""
-
-TEMPLATE_EXTRA = """Скопируй шаблон ниже, заполни и отправь:
-
-1. NickName:
-2. Уровень админ-прав:
-3. Должность:
-4. За какой день подается отчёт:
-5. Какая работа была проделана:
-6. Скриншоты проделанной работы:"""
-
-TEMPLATE_INACTIVE = """Скопируй шаблон ниже, заполни и отправь:
-
-1. Ваш NickName:
-2. Уровень админ прав:
-3. Занимаемая должность:
-4. Подменяющее лицо:
-5. Кто из главной администрации предупрежден:
-6. Дата неактива (какие дни):
-7. Причина неактива:"""
-
-WELCOME_TEXT = """👋 Добро пожаловать в бота Admin Assistant!
-
-Я помогаю сдавать отчеты и брать неактивы.
-Используй кнопки внизу для управления.
-
-📌 Доступные команды:
-!nick [Ник] — Установить свой ник
-!setlvl [ID] [LVL] — Выдать админку (только для гл. админа)
-Начать — Вызов этого меню
-
-👇 Выберите действие на клавиатуре:"""
+# ================= ШАБЛОНЫ =================
+T_NORMA = "1. NickName:\n2. Ранг:\n3. Дата:\n4. Описание:\n5. /astats:"
+T_EXTRA = "1. NickName:\n2. Ранг:\n3. Дата:\n4. Проделанная работа:"
+T_INACTIVE = "1. NickName:\n2. Ранг:\n3. Даты неактива:\n4. Причина:"
 
 # ================= БАЗА ДАННЫХ =================
 class Database:
     def __init__(self, db_file):
         self.conn = sqlite3.connect(db_file, check_same_thread=False)
         self.cursor = self.conn.cursor()
-        self.create_tables()
-
-    def create_tables(self):
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                nickname TEXT DEFAULT 'Не указан',
+                nickname TEXT DEFAULT 'Игрок',
                 lvl INTEGER DEFAULT 0,
-                prefix TEXT DEFAULT 'Игрок',
+                prefix TEXT DEFAULT 'Пользователь',
                 reg_date TEXT,
-                norma_days INTEGER DEFAULT 0,
-                answers INTEGER DEFAULT 0,
-                warns INTEGER DEFAULT 0
-            )
-        ''')
+                norma_days INTEGER DEFAULT 0
+            )''')
         self.conn.commit()
 
     def get_user(self, user_id):
         self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        result = self.cursor.fetchone()
-        if not result:
-            now = datetime.datetime.now().strftime("%d.%m.%Y")
-            self.cursor.execute("INSERT INTO users (user_id, reg_date) VALUES (?, ?)", (user_id, now))
+        res = self.cursor.fetchone()
+        if not res:
+            self.cursor.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
             self.conn.commit()
             return self.get_user(user_id)
-        return result
+        return res
 
-    def update_user(self, user_id, column, value):
-        self.cursor.execute(f"UPDATE users SET {column} = ? WHERE user_id = ?", (value, user_id))
+    def update(self, user_id, col, val):
+        self.cursor.execute(f"UPDATE users SET {col} = ? WHERE user_id = ?", (val, user_id))
         self.conn.commit()
 
 db = Database(CONFIG['db_file'])
 
-# ================= КЛАВИАТУРЫ =================
-class Keyboards:
-    @staticmethod
-    def main(is_admin=False):
-        # one_time=False ВАЖНО, чтобы кнопки не исчезали
-        kb = VkKeyboard(one_time=False)
-        
-        kb.add_button("📩 Норма", color=VkKeyboardColor.POSITIVE)
-        kb.add_button("📈 Доп. отчёт", color=VkKeyboardColor.PRIMARY)
+# ================= КЛАВИАТУРА =================
+def get_main_keyboard(is_admin):
+    kb = VkKeyboard(one_time=False) # Кнопки НЕ исчезают
+    kb.add_button("📩 Норма", color=VkKeyboardColor.POSITIVE)
+    kb.add_button("📈 Доп. отчет", color=VkKeyboardColor.PRIMARY)
+    kb.add_line()
+    kb.add_button("🕓 Неактив", color=VkKeyboardColor.SECONDARY)
+    kb.add_button("📜 Профиль", color=VkKeyboardColor.SECONDARY)
+    
+    if is_admin:
         kb.add_line()
-        kb.add_button("🕓 Неактив", color=VkKeyboardColor.SECONDARY)
-        kb.add_button("📜 Статистика", color=VkKeyboardColor.SECONDARY)
-        
-        if is_admin:
-            kb.add_line()
-            kb.add_button("👑 Админ-панель", color=VkKeyboardColor.NEGATIVE)
-        return kb.get_keyboard()
+        kb.add_button("⚙ Админ-панель", color=VkKeyboardColor.NEGATIVE)
+    return kb.get_keyboard()
 
-    @staticmethod
-    def cancel():
-        kb = VkKeyboard(one_time=False)
-        kb.add_button("❌ Отмена", color=VkKeyboardColor.NEGATIVE)
-        return kb.get_keyboard()
+def get_cancel_keyboard():
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("❌ Отмена", color=VkKeyboardColor.NEGATIVE)
+    return kb.get_keyboard()
 
-# ================= ЛОГИКА БОТА =================
-class AdminBot:
+# ================= БОТ =================
+class Bot:
     def __init__(self):
-        print("Авторизация в ВК...")
         self.vk_session = vk_api.VkApi(token=CONFIG['token'])
         self.vk = self.vk_session.get_api()
         self.longpoll = VkBotLongPoll(self.vk_session, CONFIG['group_id'])
-        self.states = {} 
-        self.temp_data = {} 
+        self.states = {}
+        self.temp = {}
+        print("Бот запущен!")
 
-    def send(self, peer_id, text, keyboard=None, attachment=None):
+    def send(self, uid, text, kb=None):
         try:
-            self.vk.messages.send(
-                peer_id=peer_id,
-                message=text,
-                random_id=get_random_id(),
-                keyboard=keyboard,
-                attachment=attachment
-            )
+            self.vk.messages.send(peer_id=uid, message=text, random_id=get_random_id(), keyboard=kb)
         except Exception as e:
             print(f"Ошибка отправки: {e}")
 
     def run(self):
-        print(f"🤖 Бот запущен! Группа ID: {CONFIG['group_id']}")
         while True:
             try:
                 for event in self.longpoll.listen():
                     if event.type == VkBotEventType.MESSAGE_NEW and event.from_user:
-                        self.handle_message(event)
+                        self.handle(event)
             except Exception as e:
-                print(f"⚠ Ошибка API (перезапуск через 3с): {e}")
-                time.sleep(3)
+                print(f"Error: {e}")
+                time.sleep(2)
 
-    def handle_message(self, event):
-        msg = event.object.message['text']
+    def handle(self, event):
         user_id = event.object.message['from_id']
+        text = event.object.message['text'].strip() # Убираем пробелы
+        text_lower = text.lower()
+        
         user_db = db.get_user(user_id)
         
-        # Проверка прав админа
+        # Авто-выдача прав создателю
         is_admin = (user_db[2] > 0) or (user_id == CONFIG['owner_id'])
         if user_id == CONFIG['owner_id'] and user_db[2] == 0:
-            db.update_user(user_id, 'lvl', 5)
-            db.update_user(user_id, 'prefix', 'Создатель')
+            db.update(user_id, 'lvl', 5)
+            db.update(user_id, 'prefix', 'Создатель')
             is_admin = True
-            self.send(user_id, "✨ Вы распознаны как Создатель.", Keyboards.main(True))
+            self.send(user_id, "✅ Вы опознаны как Создатель!", get_main_keyboard(True))
 
+        # === ГЛАВНАЯ КОМАНДА: НАЧАТЬ ===
+        if text_lower in ['начать', 'start', 'меню', 'menu', 'привет']:
+            self.states[user_id] = None
+            self.send(user_id, "👋 Главное меню загружено.\nИспользуй кнопки:", get_main_keyboard(is_admin))
+            return
+
+        # === КОМАНДА ОТМЕНЫ ===
+        if text_lower in ['отмена', '❌ отмена', '/cancel']:
+            self.states[user_id] = None
+            self.send(user_id, "Действие отменено.", get_main_keyboard(is_admin))
+            return
+
+        # === СМЕНА НИКА ===
+        if text_lower.startswith('!nick ') or text_lower.startswith('/nick '):
+            new_nick = text[6:]
+            db.update(user_id, 'nickname', new_nick)
+            self.send(user_id, f"✅ Ник изменен на: {new_nick}", get_main_keyboard(is_admin))
+            return
+
+        # === ЛОГИКА ДИАЛОГОВ (ЕСЛИ ЖДЕМ ОТВЕТ) ===
         state = self.states.get(user_id)
 
-        # === ГЛОБАЛЬНЫЕ КОМАНДЫ ===
-        if msg.lower() in ["начать", "start", "/start", "меню"]:
-            self.states[user_id] = None
-            self.send(user_id, WELCOME_TEXT, Keyboards.main(is_admin))
+        if state == "WAIT_NORMA":
+            self.temp[user_id] = text
+            self.states[user_id] = "WAIT_PHOTO_NORMA"
+            self.send(user_id, "📸 Теперь пришли скриншот /time или /astats", get_cancel_keyboard())
             return
 
-        if msg == "❌ Отмена" or msg.lower() == "/cancel":
-            self.states[user_id] = None
-            self.send(user_id, "Действие отменено.", Keyboards.main(is_admin))
+        if state == "WAIT_PHOTO_NORMA":
+            if event.object.message['attachments']:
+                self.send(user_id, "✅ Норма отправлена!", get_main_keyboard(is_admin))
+                # Пересылка создателю
+                self.vk.messages.send(
+                    peer_id=CONFIG['owner_id'], 
+                    message=f"📩 НОРМА от @id{user_id}\n\n{self.temp[user_id]}",
+                    random_id=get_random_id(),
+                    forward_messages=event.object.message['id']
+                )
+                self.states[user_id] = None
+            else:
+                self.send(user_id, "❌ Нужен скриншот! (или напиши 'Отмена')")
             return
-        
-        # === ОБРАБОТКА СОСТОЯНИЙ (Диалоги) ===
-        
-        # 1. ОБРАБОТКА НОРМЫ
-        if state == "WAIT_NORMA_TEXT":
-            self.temp_data[user_id] = {'text': msg}
-            self.states[user_id] = "WAIT_NORMA_PHOTO"
-            self.send(user_id, "📸 Теперь прикрепите скриншот /astats (время в игре).", Keyboards.cancel())
+
+        if state == "WAIT_EXTRA":
+            self.temp[user_id] = text
+            self.states[user_id] = "WAIT_PHOTO_EXTRA"
+            self.send(user_id, "📸 Прикрепи доказательства работы:", get_cancel_keyboard())
             return
             
-        if state == "WAIT_NORMA_PHOTO":
+        if state == "WAIT_PHOTO_EXTRA":
             if event.object.message['attachments']:
-                # Пересылаем сообщение создателю
+                self.send(user_id, "✅ Доп. отчет отправлен!", get_main_keyboard(is_admin))
                 self.vk.messages.send(
-                    peer_id=CONFIG['owner_id'],
-                    message=f"📩 НОВАЯ НОРМА от @id{user_id}\n\n{self.temp_data[user_id]['text']}",
+                    peer_id=CONFIG['owner_id'], 
+                    message=f"📈 ДОП. ОТЧЕТ от @id{user_id}\n\n{self.temp[user_id]}",
                     random_id=get_random_id(),
                     forward_messages=event.object.message['id']
                 )
-                self.send(user_id, "✅ Норма успешно отправлена руководству!", Keyboards.main(is_admin))
-                db.update_user(user_id, 'norma_days', int(user_db[5]) + 1)
                 self.states[user_id] = None
             else:
-                self.send(user_id, "❌ Пришлите скриншот, или нажмите Отмена.", Keyboards.cancel())
+                self.send(user_id, "❌ Нужен скриншот!")
             return
 
-        # 2. ОБРАБОТКА ДОП. РЕПОРТА
-        if state == "WAIT_EXTRA_TEXT":
-            self.temp_data[user_id] = {'text': msg}
-            self.states[user_id] = "WAIT_EXTRA_PHOTO"
-            self.send(user_id, "📸 Прикрепите доказательства (скриншоты).", Keyboards.cancel())
-            return
-
-        if state == "WAIT_EXTRA_PHOTO":
-            if event.object.message['attachments']:
-                self.vk.messages.send(
-                    peer_id=CONFIG['owner_id'],
-                    message=f"📈 ДОП. ОТЧЕТ от @id{user_id}\n\n{self.temp_data[user_id]['text']}",
-                    random_id=get_random_id(),
-                    forward_messages=event.object.message['id']
-                )
-                self.send(user_id, "✅ Доп. отчет отправлен!", Keyboards.main(is_admin))
-                self.states[user_id] = None
-            else:
-                self.send(user_id, "❌ Пришлите скриншот работы.", Keyboards.cancel())
-            return
-
-        # 3. ОБРАБОТКА НЕАКТИВА
-        if state == "WAIT_INACTIVE_TEXT":
+        if state == "WAIT_INACTIVE":
+            self.send(user_id, "✅ Заявка на неактив отправлена.", get_main_keyboard(is_admin))
             self.vk.messages.send(
-                peer_id=CONFIG['owner_id'],
-                message=f"💤 ЗАЯВЛЕНИЕ НА НЕАКТИВ от @id{user_id}\n\n{msg}",
+                peer_id=CONFIG['owner_id'], 
+                message=f"💤 НЕАКТИВ от @id{user_id}\n\n{text}",
                 random_id=get_random_id()
             )
-            self.send(user_id, "✅ Заявка на неактив отправлена руководству.", Keyboards.main(is_admin))
             self.states[user_id] = None
             return
 
-        # === ОБРАБОТКА КНОПОК МЕНЮ ===
-
-        if msg == "📩 Норма":
-            self.states[user_id] = "WAIT_NORMA_TEXT"
-            self.send(user_id, TEMPLATE_NORMA, Keyboards.cancel())
+        # === ОБРАБОТКА КНОПОК ===
+        if text == "📩 Норма":
+            self.states[user_id] = "WAIT_NORMA"
+            self.send(user_id, f"📝 Скопируй и заполни:\n\n{T_NORMA}", get_cancel_keyboard())
         
-        elif msg == "📈 Доп. отчёт":
-            self.states[user_id] = "WAIT_EXTRA_TEXT"
-            self.send(user_id, TEMPLATE_EXTRA, Keyboards.cancel())
+        elif text == "📈 Доп. отчет":
+            self.states[user_id] = "WAIT_EXTRA"
+            self.send(user_id, f"📝 Скопируй и заполни:\n\n{T_EXTRA}", get_cancel_keyboard())
 
-        elif msg == "🕓 Неактив":
-            self.states[user_id] = "WAIT_INACTIVE_TEXT"
-            self.send(user_id, TEMPLATE_INACTIVE, Keyboards.cancel())
+        elif text == "🕓 Неактив":
+            self.states[user_id] = "WAIT_INACTIVE"
+            self.send(user_id, f"📝 Причина и даты:\n\n{T_INACTIVE}", get_cancel_keyboard())
 
-        elif msg == "📜 Статистика":
-            text = f"📊 ТВОЯ СТАТИСТИКА:\n👤 Ник: {user_db[1]}\n🔰 Ранг: {user_db[3]} (Lvl {user_db[2]})\n✅ Сдано норм: {user_db[5]}"
-            self.send(user_id, text, Keyboards.main(is_admin))
+        elif text == "📜 Профиль":
+            info = f"👤 Ник: {user_db[1]}\n🔰 Роль: {user_db[3]}\n📊 Уровень: {user_db[2]}"
+            self.send(user_id, info, get_main_keyboard(is_admin))
 
-        elif msg.startswith("!nick "):
-            new_nick = msg[6:]
-            db.update_user(user_id, 'nickname', new_nick)
-            self.send(user_id, f"✅ Ваш ник обновлен: {new_nick}")
+        elif text == "⚙ Админ-панель" and is_admin:
+            self.send(user_id, "Команды админа:\n!setlvl [ID] [LVL] - выдать права", get_main_keyboard(is_admin))
 
-        elif msg.startswith("!setlvl") and is_admin:
+        elif text.startswith("!setlvl") and is_admin:
             try:
-                parts = msg.split()
-                if '[id' in parts[1]:
-                    target = int(parts[1].split('|')[0].replace('[id', ''))
-                else:
-                    target = int(parts[1])
-                lvl = int(parts[2])
-                db.get_user(target)
-                db.update_user(target, 'lvl', lvl)
-                roles = {0:"Игрок", 1:"Мл.Модер", 2:"Модер", 3:"Ст.Модер", 4:"Админ", 5:"Куратор", 6:"ЗГА", 7:"ГА"}
-                role_name = roles.get(lvl, "Спец.Админ")
-                db.update_user(target, 'prefix', role_name)
-                
-                self.send(user_id, f"✅ Игроку @id{target} выдан {lvl} уровень ({role_name}).")
-                self.send(target, f"🎉 Вам выдан администраторский уровень: {lvl} ({role_name})!", Keyboards.main(True))
+                parts = text.split()
+                tid = int(parts[1].split('|')[0].replace('[id','').replace(']',''))
+                tlvl = int(parts[2])
+                db.update(tid, 'lvl', tlvl)
+                name_role = "Администратор" if tlvl > 0 else "Игрок"
+                db.update(tid, 'prefix', name_role)
+                self.send(user_id, f"✅ Выдан уровень {tlvl}")
+                self.send(tid, f"🎉 Вам выданы права: {name_role}", get_main_keyboard(True))
             except:
-                self.send(user_id, "Ошибка! Пиши: !setlvl [ID] [Уровень (1-7)]")
+                self.send(user_id, "Ошибка команды. !setlvl ID LEVEL")
 
         else:
-            # Если команда не понятна, но мы не в режиме ожидания отчета
-            if user_id not in self.states or self.states[user_id] is None:
-                self.send(user_id, "ℹ Используйте кнопки меню.", Keyboards.main(is_admin))
+            # ЕСЛИ КОМАНДА НЕИЗВЕСТНА -> ПОКАЗАТЬ МЕНЮ
+            self.send(user_id, "Я не понял команду. Вот меню:", get_main_keyboard(is_admin))
 
 if __name__ == "__main__":
-    bot = AdminBot()
+    bot = Bot()
     bot.run()
