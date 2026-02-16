@@ -1,309 +1,416 @@
-import telebot
-from telebot import types
-import yt_dlp
-import os
-import time
+# -*- coding: utf-8 -*-
+import vk_api
+from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
+from vk_api.keyboard import VkKeyboard, VkKeyboardColor
+from vk_api.utils import get_random_id
+import sqlite3
+import datetime
 import threading
-import shutil
-import logging
-import json
-from telebot.apihelper import ApiTelegramException
+import time
 
-# ================= ⚙️ СИСТЕМНОЕ ЯДРО =================
-TOKEN = "8463954141:AAHd96oRhacVPNF9BYHk5VuEwfKihC7jLn0"
-BOT_VER = "Quantum v4.0"
-
-# Папки и настройки
-DOWNLOAD_PATH = "downloads_cache"
-MAX_FILE_SIZE = 49 * 1024 * 1024  # 49 MB (Оставляем запас)
-
-# Инициализация
-if os.path.exists(DOWNLOAD_PATH): shutil.rmtree(DOWNLOAD_PATH)
-os.makedirs(DOWNLOAD_PATH)
-
-logging.basicConfig(level=logging.INFO)
-bot = telebot.TeleBot(TOKEN)
-
-# Кэш метаданных (чтобы не парсить ссылку дважды при нажатии кнопок)
-# Структура: {chat_id: {data}}
-meta_cache = {}
-
-# ================= 🎨 ДИЗАЙН И ТЕКСТЫ =================
-TEXTS = {
-    "welcome": (
-        "🌌 <b>QUANTUM DOWNLOADER</b>\n"
-        "<i>Система загрузки контента активирована.</i>\n\n"
-        "Я умею извлекать видео и аудио из квантового пространства:\n"
-        "💠 <b>YouTube</b> (Video / Shorts)\n"
-        "💠 <b>TikTok</b> (No Watermark)\n"
-        "💠 <b>Instagram</b> (Reels)\n"
-        "💠 <b>RuTube / VK</b>\n\n"
-        "📡 <i>Ожидаю входящую ссылку...</i>"
-    ),
-    "analyzing": "🔄 <b>АНАЛИЗ ПРОТОКОЛА...</b>\n<i>Устанавливаю соединение с сервером...</i>",
-    "downloading": "📥 <b>ЗАГРУЗКА НА СЕРВЕР...</b>\n<i>Извлекаю биты данных [===------]</i>",
-    "uploading": "📤 <b>ОТПРАВКА В TELEGRAM...</b>\n<i>Финальная стадия передачи.</i>",
-    "error": "⛔ <b>СБОЙ СИСТЕМЫ</b>\nНе удалось обработать запрос. Ссылка повреждена или доступ закрыт.",
-    "too_large": "⚠️ <b>ФАЙЛ СЛИШКОМ ВЕЛИК</b>\nТелеграм не принимает файлы >50 МБ от ботов.\nПопробуйте выбрать качество ниже.",
-    "footer": f"🤖 Powered by {BOT_VER}"
+# ================= КОНФИГУРАЦИЯ =================
+CONFIG = {
+    "token": "ВСТАВЬ_СЮДА_НОВЫЙ_ТОКЕН",  # <--- ЗАМЕНИТЬ
+    "group_id": 12345678,                 # <--- ЗАМЕНИТЬ НА ID ГРУППЫ (ЦИФРЫ)
+    "owner_id": 123456789,                # <--- ТВОЙ ЛИЧНЫЙ ID (ЦИФРЫ)
+    "db_file": "server_bot.db"
 }
 
-# ================= 🧠 ЛОГИКА АНАЛИЗА (СЛОЖНАЯ) =================
-def format_time(seconds):
-    if not seconds: return "0:00"
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
-    if h > 0: return f"{h}:{m:02d}:{s:02d}"
-    return f"{m}:{s:02d}"
+# ================= МЕНЕДЖЕР БАЗЫ ДАННЫХ =================
+class Database:
+    def __init__(self, db_file):
+        self.conn = sqlite3.connect(db_file, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.create_tables()
 
-def get_best_formats(info):
-    """Сложная логика выбора форматов для меню"""
-    formats = info.get('formats', [])
-    buttons_data = []
-    
-    # 1. Добавляем Аудио
-    buttons_data.append({"type": "audio", "label": "🎵 Audio (MP3)", "id": "bestaudio"})
-
-    # 2. Фильтруем видео форматы
-    seen_qualities = set()
-    
-    # Сортируем: сначала маленькие, потом большие
-    sorted_formats = sorted(formats, key=lambda x: x.get('height') or 0)
-
-    for f in sorted_formats:
-        h = f.get('height')
-        if not h or h < 144: continue # Пропускаем мусор
-        if h in seen_qualities: continue # Не дублируем
-        if f.get('ext') != 'mp4': continue # Только mp4 для стабильности
-        
-        # Определяем тип загрузки
-        # Если есть видео+звук (acodec != none) -> Это Ракета (Быстрая отправка)
-        # Если звука нет (acodec == none) -> Это Диск (Надо качать и клеить)
-        has_sound = f.get('acodec') != 'none'
-        icon = "🚀" if has_sound else "💾"
-        
-        size = f.get('filesize') or f.get('filesize_approx') or 0
-        size_str = f"{round(size / 1024 / 1024, 1)} MB" if size else "N/A"
-        
-        label = f"{icon} {h}p • {size_str}"
-        
-        buttons_data.append({
-            "type": "video",
-            "label": label,
-            "id": f['format_id'],
-            "res": h,
-            "is_rocket": has_sound,
-            "url": f.get('url') # Прямая ссылка для ракеты
-        })
-        
-        seen_qualities.add(h)
-        if h >= 1080: break # Выше 1080 не показываем (слишком тяжелые)
-
-    return buttons_data
-
-def process_url(url, chat_id, message_id):
-    try:
-        # Настройки для БЫСТРОГО парсинга (без скачивания)
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
-            'extract_flat': False,
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            # Сохраняем в кэш сессии
-            meta_cache[chat_id] = info
-            
-            # Данные для карточки
-            title = info.get('title', 'Без названия')
-            author = info.get('uploader', 'Неизвестно')
-            duration = format_time(info.get('duration'))
-            views = info.get('view_count', 0)
-            thumb = info.get('thumbnail')
-            
-            # Формируем клавиатуру
-            markup = types.InlineKeyboardMarkup(row_width=2)
-            btns = get_best_formats(info)
-            
-            btn_objects = []
-            for btn in btns:
-                # Callback: type|format_id
-                # Используем короткий callback, чтобы не переполнить лимит телеграма
-                cb_data = f"dl|{btn['type']}|{btn['id']}"
-                btn_objects.append(types.InlineKeyboardButton(btn['label'], callback_data=cb_data))
-            
-            markup.add(*btn_objects)
-            
-            # Добавляем кнопку WebApp для обхода блокировок
-            web_url = f"https://yewtu.be/watch?v={info.get('id')}"
-            markup.add(types.InlineKeyboardButton("📺 Смотреть Онлайн (No Lag)", web_app=types.WebAppInfo(web_url)))
-
-            # Текст карточки
-            caption = (
-                f"🎬 <b>{title}</b>\n\n"
-                f"👤 Автор: <code>{author}</code>\n"
-                f"⏱ Время: {duration} | 👀 Просмотры: {views}\n\n"
-                f"👇 <b>Выберите формат загрузки:</b>\n"
-                f"🚀 — <i>Мгновенная отправка (Direct)</i>\n"
-                f"💾 — <i>Загрузка через сервер (High Quality)</i>"
+    def create_tables(self):
+        # Таблица пользователей
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                nickname TEXT DEFAULT 'Не указан',
+                lvl INTEGER DEFAULT 0,
+                prefix TEXT DEFAULT 'Игрок',
+                reg_date TEXT,
+                norma_days INTEGER DEFAULT 0,
+                answers INTEGER DEFAULT 0,
+                warns INTEGER DEFAULT 0
             )
+        ''')
+        # Таблица неактивов
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS inactives (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                date_start TEXT,
+                date_end TEXT,
+                reason TEXT,
+                status TEXT DEFAULT 'wait' 
+            )
+        ''')
+        self.conn.commit()
 
-            bot.delete_message(chat_id, message_id)
-            if thumb:
-                bot.send_photo(chat_id, thumb, caption=caption, reply_markup=markup, parse_mode='HTML')
-            else:
-                bot.send_message(chat_id, caption, reply_markup=markup, parse_mode='HTML')
+    def get_user(self, user_id):
+        self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        result = self.cursor.fetchone()
+        if not result:
+            now = datetime.datetime.now().strftime("%d.%m.%Y")
+            self.cursor.execute("INSERT INTO users (user_id, reg_date) VALUES (?, ?)", (user_id, now))
+            self.conn.commit()
+            return self.get_user(user_id)
+        return result
 
-    except Exception as e:
-        logging.error(e)
-        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=TEXTS['error'], parse_mode='HTML')
-
-# ================= 📥 ДВИЖОК ЗАГРУЗКИ =================
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call):
-    try:
-        chat_id = call.message.chat.id
-        data = call.data.split("|") # dl | type | id
-        
-        if len(data) != 3 or chat_id not in meta_cache:
-            bot.answer_callback_query(call.id, "⚠️ Сессия истекла. Отправьте ссылку снова.")
-            return
-
-        dl_type = data[1]
-        fmt_id = data[2]
-        info = meta_cache[chat_id]
-        
-        # --- ЛОГИКА АУДИО ---
-        if dl_type == "audio":
-            bot.answer_callback_query(call.id, "🎵 Обработка аудио...")
-            msg = bot.send_message(chat_id, "🎵 <b>Конвертация аудио...</b>", parse_mode='HTML')
-            threading.Thread(target=download_engine, args=(info, 'audio', fmt_id, chat_id, msg.message_id)).start()
-            return
-
-        # --- ЛОГИКА ВИДЕО ---
-        # Ищем формат в JSON
-        selected_format = next((f for f in info['formats'] if f['format_id'] == fmt_id), None)
-        
-        if not selected_format:
-            bot.answer_callback_query(call.id, "Ошибка формата")
-            return
-
-        # 🚀 ПОПЫТКА 1: DIRECT STREAM (Мгновенно)
-        # Если есть прямая ссылка и есть звук - пробуем кинуть ссылку телеграму
-        if selected_format.get('url') and selected_format.get('acodec') != 'none':
-            bot.answer_callback_query(call.id, "🚀 Запускаю Direct Stream...")
-            try:
-                bot.send_video(
-                    chat_id, 
-                    selected_format['url'], 
-                    caption=f"🎬 <b>{info['title']}</b>\n{TEXTS['footer']}",
-                    parse_mode='HTML',
-                    supports_streaming=True
-                )
-                return # УСПЕХ!
-            except ApiTelegramException:
-                # Если Телеграм отверг ссылку (например, YouTube IP ban), идем к Попытке 2
-                pass
-
-        # 💾 ПОПЫТКА 2: PHYSICAL DOWNLOAD (Через сервер)
-        bot.answer_callback_query(call.id, "📥 Переход в режим загрузки...")
-        msg = bot.send_message(chat_id, TEXTS['downloading'], parse_mode='HTML')
-        threading.Thread(target=download_engine, args=(info, 'video', fmt_id, chat_id, msg.message_id)).start()
-
-    except Exception as e:
-        print(e)
-
-def download_engine(info, type_content, fmt_id, chat_id, message_id):
-    filename = f"{DOWNLOAD_PATH}/{chat_id}_{int(time.time())}"
-    
-    try:
-        # Настройки yt-dlp для скачивания
-        if type_content == 'audio':
-            ydl_opts = {
-                'format': 'bestaudio/best',
-                'outtmpl': filename,
-                'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3'}],
-                'max_filesize': MAX_FILE_SIZE
-            }
-            final_ext = ".mp3"
+    def update_user(self, user_id, column, value):
+        if isinstance(value, str) and (value.startswith('+') or value.startswith('-')):
+             self.cursor.execute(f"UPDATE users SET {column} = {column} + ? WHERE user_id = ?", (int(value), user_id))
         else:
-            # Для видео
-            ydl_opts = {
-                'format': f"{fmt_id}+bestaudio/best", # Склеить видео + аудио
-                'outtmpl': filename,
-                'max_filesize': MAX_FILE_SIZE,
-                'merge_output_format': 'mp4'
-            }
-            final_ext = ".mp4"
+            self.cursor.execute(f"UPDATE users SET {column} = ? WHERE user_id = ?", (value, user_id))
+        self.conn.commit()
 
-        # КАЧАЕМ
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([info['webpage_url']])
-            
-        # Проверяем результат (yt-dlp может добавить расширение)
-        final_path = filename + final_ext
-        if not os.path.exists(final_path):
-            # Иногда расширение другое, ищем файл
-            for f in os.listdir(DOWNLOAD_PATH):
-                if f.startswith(f"{chat_id}_"):
-                    final_path = os.path.join(DOWNLOAD_PATH, f)
-                    break
+    def add_inactive(self, user_id, d_start, d_end, reason):
+        self.cursor.execute("INSERT INTO inactives (user_id, date_start, date_end, reason) VALUES (?, ?, ?, ?)", 
+                            (user_id, d_start, d_end, reason))
+        self.conn.commit()
+        return self.cursor.lastrowid
+
+    def update_inactive_status(self, inactive_id, status):
+        self.cursor.execute("UPDATE inactives SET status = ? WHERE id = ?", (status, inactive_id))
+        self.conn.commit()
         
-        if os.path.exists(final_path):
-            file_size = os.path.getsize(final_path)
-            if file_size > MAX_FILE_SIZE:
-                bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=TEXTS['too_large'], parse_mode='HTML')
-                os.remove(final_path)
-                return
+    def get_inactive(self, inactive_id):
+        self.cursor.execute("SELECT * FROM inactives WHERE id = ?", (inactive_id,))
+        return self.cursor.fetchone()
 
-            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=TEXTS['uploading'], parse_mode='HTML')
-            
-            with open(final_path, 'rb') as f:
-                if type_content == 'audio':
-                    bot.send_audio(chat_id, f, title=info['title'], performer=info['uploader'])
-                else:
-                    bot.send_video(
-                        chat_id, f, 
-                        caption=f"📼 <b>{info['title']}</b>\n💾 Size: {round(file_size/1024/1024, 1)} MB\n\n{TEXTS['footer']}",
-                        parse_mode='HTML',
-                        supports_streaming=True
-                    )
-            
-            bot.delete_message(chat_id, message_id)
-            # Чистка
-            os.remove(final_path)
-        else:
-            raise Exception("Файл не найден")
+db = Database(CONFIG['db_file'])
 
-    except Exception as e:
-        logging.error(f"DL Error: {e}")
-        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="❌ <b>Ошибка при загрузке.</b>\nВозможно, не хватает кодеков на сервере.", parse_mode='HTML')
-        # Пытаемся почистить
+# ================= КЛАВИАТУРЫ =================
+class Keyboards:
+    @staticmethod
+    def main(is_admin=False):
+        kb = VkKeyboard(one_time=False)
+        kb.add_button("📜 Моя статистика", color=VkKeyboardColor.PRIMARY)
+        kb.add_line()
+        kb.add_button("📩 Отправить норму", color=VkKeyboardColor.POSITIVE)
+        kb.add_button("🕓 Неактив", color=VkKeyboardColor.SECONDARY)
+        
+        if is_admin:
+            kb.add_line()
+            kb.add_button("👑 Админ Панель", color=VkKeyboardColor.NEGATIVE)
+        return kb.get_keyboard()
+
+    @staticmethod
+    def admin_panel():
+        kb = VkKeyboard(one_time=False)
+        kb.add_button("🔍 Проверить норму", color=VkKeyboardColor.PRIMARY)
+        kb.add_button("💤 Заявки неактив", color=VkKeyboardColor.PRIMARY)
+        kb.add_line()
+        kb.add_button("⚙ Управление", color=VkKeyboardColor.SECONDARY)
+        kb.add_button("🔙 В меню", color=VkKeyboardColor.NEGATIVE)
+        return kb.get_keyboard()
+
+    @staticmethod
+    def cancel():
+        kb = VkKeyboard(one_time=False)
+        kb.add_button("❌ Отмена", color=VkKeyboardColor.NEGATIVE)
+        return kb.get_keyboard()
+
+    @staticmethod
+    def inactive_decision(inactive_id):
+        # INLINE клавиатура (кнопки под сообщением)
+        kb = VkKeyboard(inline=True)
+        kb.add_callback_button("✅ Одобрить", color=VkKeyboardColor.POSITIVE, payload={"type": "inactive_ok", "id": inactive_id})
+        kb.add_callback_button("❌ Отказать", color=VkKeyboardColor.NEGATIVE, payload={"type": "inactive_no", "id": inactive_id})
+        return kb.get_keyboard()
+
+# ================= ЛОГИКА БОТА =================
+class AdminBot:
+    def __init__(self):
+        self.vk_session = vk_api.VkApi(token=CONFIG['token'])
+        self.vk = self.vk_session.get_api()
+        # Используем BotLongPoll для работы с кнопками и событиями группы
+        self.longpoll = VkBotLongPoll(self.vk_session, CONFIG['group_id'])
+        self.states = {} # Состояния пользователей: {user_id: "STATE_NAME"}
+        self.temp_data = {} # Временные данные: {user_id: {...}}
+
+    def send(self, peer_id, text, keyboard=None, attachment=None):
         try:
-            if os.path.exists(final_path): os.remove(final_path)
-        except: pass
+            self.vk.messages.send(
+                peer_id=peer_id,
+                message=text,
+                random_id=get_random_id(),
+                keyboard=keyboard,
+                attachment=attachment
+            )
+        except Exception as e:
+            print(f"Ошибка отправки сообщения: {e}")
 
-# ================= 🚀 ЗАПУСК БОТА =================
+    def get_user_name(self, user_id):
+        try:
+            info = self.vk.users.get(user_ids=user_id)[0]
+            return f"{info['first_name']} {info['last_name']}"
+        except:
+            return "Unknown"
 
-@bot.message_handler(commands=['start'])
-def start_h(message):
-    bot.send_message(message.chat.id, TEXTS['welcome'], parse_mode='HTML')
+    def run(self):
+        print("🤖 Бот успешно запущен и готов к работе!")
+        
+        # Основной цикл обработки событий
+        for event in self.longpoll.listen():
+            try:
+                # 1. Обработка нажатий на INLINE кнопки (Callback)
+                if event.type == VkBotEventType.MESSAGE_EVENT:
+                    self.handle_callback(event)
 
-@bot.message_handler(content_types=['text'])
-def text_h(message):
-    url = message.text.strip()
-    # Простейшая валидация
-    if "http" in url:
-        msg = bot.send_message(message.chat.id, TEXTS['analyzing'], parse_mode='HTML')
-        threading.Thread(target=process_url, args=(url, message.chat.id, msg.message_id)).start()
+                # 2. Обработка входящих сообщений
+                elif event.type == VkBotEventType.MESSAGE_NEW:
+                    # Фильтруем беседы, работаем только в ЛС или если упомянули
+                    if event.from_user:
+                        self.handle_message(event)
+            except Exception as e:
+                print(f"Ошибка в цикле событий: {e}")
+
+    def handle_callback(self, event):
+        payload = event.object.payload
+        user_id = event.obj.peer_id
+        
+        # Проверка прав администратора того, кто нажал кнопку
+        admin_data = db.get_user(user_id)
+        if admin_data[2] < 1 and user_id != CONFIG['owner_id']:
+            self.vk.messages.sendMessageEventAnswer(
+                event_id=event.object.event_id,
+                user_id=user_id,
+                peer_id=user_id,
+                event_data='{"type": "show_snackbar", "text": "❌ У вас нет прав!"}'
+            )
+            return
+
+        # Логика кнопок
+        if payload.get('type') == 'inactive_ok':
+            in_id = payload['id']
+            db.update_inactive_status(in_id, "Одобрено")
+            
+            # Получаем ID того, кто просил неактив
+            req_data = db.get_inactive(in_id)
+            requester_id = req_data[1]
+            
+            # Редактируем сообщение у админа
+            self.vk.messages.edit(
+                peer_id=user_id,
+                conversation_message_id=event.obj.conversation_message_id,
+                message=f"✅ Заявка #{in_id} ОДОБРЕНА администратором @id{user_id}.",
+                keyboard=None
+            )
+            # Пишем юзеру
+            self.send(requester_id, f"✅ Ваш неактив (#{in_id}) был одобрен!")
+
+        elif payload.get('type') == 'inactive_no':
+            in_id = payload['id']
+            db.update_inactive_status(in_id, "Отказано")
+            
+            req_data = db.get_inactive(in_id)
+            requester_id = req_data[1]
+
+            self.vk.messages.edit(
+                peer_id=user_id,
+                conversation_message_id=event.obj.conversation_message_id,
+                message=f"❌ Заявка #{in_id} ОТКЛОНЕНА администратором @id{user_id}.",
+                keyboard=None
+            )
+            self.send(requester_id, f"❌ Ваш неактив (#{in_id}) был отклонен.")
+
+    def handle_message(self, event):
+        msg = event.object.message['text']
+        user_id = event.object.message['from_id']
+        
+        user_db = db.get_user(user_id)
+        is_admin = (user_db[2] > 0) or (user_id == CONFIG['owner_id'])
+        
+        # Автовыдача создателя
+        if user_id == CONFIG['owner_id'] and user_db[2] == 0:
+            db.update_user(user_id, 'lvl', 5)
+            db.update_user(user_id, 'prefix', 'Создатель')
+            self.send(user_id, "✨ Система опознала Создателя. Права выданы.")
+            is_admin = True
+
+        state = self.states.get(user_id)
+
+        # === ГЛОБАЛЬНЫЕ КОМАНДЫ ===
+        if msg == "❌ Отмена" or msg.lower() == "/cancel":
+            self.states[user_id] = None
+            self.temp_data[user_id] = {}
+            self.send(user_id, "Действие отменено.", Keyboards.main(is_admin))
+            return
+        
+        if msg == "🔙 В меню":
+            self.states[user_id] = None
+            self.send(user_id, "Главное меню", Keyboards.main(is_admin))
+            return
+
+        # === МАШИНА СОСТОЯНИЙ (Диалоги) ===
+        
+        # 1. Подача нормы (Ожидание фото)
+        if state == "WAIT_NORM_PHOTO":
+            attachments = event.object.message['attachments']
+            photo_url = None
+            for att in attachments:
+                if att['type'] == 'photo':
+                    # Берем самое большое фото
+                    photo_url = att['photo']['sizes'][-1]['url']
+                    break
+            
+            if photo_url or attachments: # Принимаем любой аттач
+                self.send(user_id, "✅ Отчет принят! Руководство проверит его.", Keyboards.main(is_admin))
+                
+                # Уведомление создателю
+                admin_text = f"🔔 НОВЫЙ ОТЧЕТ\n👤 От: @id{user_id} ({user_db[1]})\n📝 Статус: На проверке"
+                # Форвардим сообщение
+                try:
+                    self.vk.messages.send(
+                        peer_id=CONFIG['owner_id'],
+                        message=admin_text,
+                        random_id=get_random_id(),
+                        forward_messages=event.object.message['id']
+                    )
+                except: pass
+                
+                self.states[user_id] = None
+            else:
+                self.send(user_id, "❌ Прикрепите скриншот /astats!", Keyboards.cancel())
+            return
+
+        # 2. Неактив (Даты)
+        if state == "WAIT_INACTIVE_DATES":
+            self.temp_data[user_id] = {'dates': msg}
+            self.states[user_id] = "WAIT_INACTIVE_REASON"
+            self.send(user_id, "📝 Укажите причину неактива:", Keyboards.cancel())
+            return
+
+        # 3. Неактив (Причина + Сохранение)
+        if state == "WAIT_INACTIVE_REASON":
+            dates = self.temp_data[user_id].get('dates', 'Не указано')
+            reason = msg
+            
+            # Парсим даты (просто как текст для примера, можно усложнить)
+            in_id = db.add_inactive(user_id, dates, dates, reason)
+            
+            self.send(user_id, f"✅ Заявка #{in_id} отправлена на рассмотрение.", Keyboards.main(is_admin))
+            self.states[user_id] = None
+            
+            # Уведомление создателю с кнопками
+            admin_msg = (
+                f"💤 ЗАЯВКА НА НЕАКТИВ #{in_id}\n"
+                f"👤 От: @id{user_id}\n"
+                f"📅 Даты: {dates}\n"
+                f"💬 Причина: {reason}"
+            )
+            self.send(CONFIG['owner_id'], admin_msg, Keyboards.inactive_decision(in_id))
+            return
+
+        # 4. Смена ника (/nick)
+        if msg.lower().startswith("/nick "):
+            new_nick = msg[6:]
+            db.update_user(user_id, 'nickname', new_nick)
+            self.send(user_id, f"✅ Ваш ник изменен на: {new_nick}")
+            return
+
+        # === МЕНЮ И КНОПКИ ===
+
+        if msg == "📜 Моя статистика":
+            # Красивый вывод статистики
+            reg_dt = user_db[4]
+            try:
+                days = (datetime.datetime.now() - datetime.datetime.strptime(reg_dt, "%d.%m.%Y")).days
+            except: days = 0
+
+            text = (
+                f"📊 ADMIN STATISTICS\n"
+                f"➖➖➖➖➖➖➖➖➖➖\n"
+                f"👤 Ник: {user_db[1]}\n"
+                f"🆔 ID: {user_id}\n"
+                f"🔰 Должность: {user_db[3]} (Lvl {user_db[2]})\n"
+                f"📅 На посту: {days} дн. ({reg_dt})\n"
+                f"➖➖➖➖➖➖➖➖➖➖\n"
+                f"✅ Норма (дней): {user_db[5]}\n"
+                f"✉ Ответов: {user_db[6]}\n"
+                f"⚠ Выговоров: {user_db[7]}\n"
+                f"➖➖➖➖➖➖➖➖➖➖\n"
+                f"⚙ Для смены ника: /nick Имя_Фамилия"
+            )
+            self.send(user_id, text)
+
+        elif msg == "📩 Отправить норму":
+            self.states[user_id] = "WAIT_NORM_PHOTO"
+            self.send(user_id, "📸 Пожалуйста, отправьте скриншот вашей статистики (/astats).", Keyboards.cancel())
+
+        elif msg == "🕓 Неактив":
+            self.states[user_id] = "WAIT_INACTIVE_DATES"
+            self.send(user_id, "📅 Введите даты неактива (Например: 20.02 - 22.02):", Keyboards.cancel())
+
+        elif msg == "👑 Админ Панель" and is_admin:
+            self.send(user_id, "🔒 Добро пожаловать в панель управления.", Keyboards.admin_panel())
+
+        elif msg == "💤 Заявки неактив" and is_admin:
+            # Получаем последние 5 заявок 'wait'
+            conn = sqlite3.connect(CONFIG['db_file'])
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM inactives WHERE status='wait' ORDER BY id DESC LIMIT 5")
+            rows = cur.fetchall()
+            conn.close()
+
+            if not rows:
+                self.send(user_id, "📭 Новых заявок на неактив нет.")
+            else:
+                self.send(user_id, f"Найдено {len(rows)} активных заявок:")
+                for row in rows:
+                    txt = (
+                        f"🔹 Заявка #{row[0]}\n"
+                        f"👤 User: @id{row[1]}\n"
+                        f"📅 {row[2]}\n"
+                        f"💬 {row[4]}"
+                    )
+                    # К каждому сообщению лепим кнопки
+                    self.send(user_id, txt, Keyboards.inactive_decision(row[0]))
+
+        # Команды выдачи админки (для создателя или ст. админов)
+        elif msg.startswith("!setlvl") and is_admin:
+            # !setlvl @id 3
+            try:
+                parts = msg.split()
+                if len(parts) < 3:
+                    self.send(user_id, "Ошибка. Формат: !setlvl [ID/Ссылка] [Уровень]")
+                    return
+                
+                target = parts[1]
+                lvl = int(parts[2])
+                
+                # Получаем ID
+                target_id = user_id # Fallback
+                if "vk.com/" in target:
+                    screen_name = target.split('/')[-1]
+                    target_id = self.vk.utils.resolveScreenName(screen_name=screen_name)['object_id']
+                elif "[id" in target:
+                    # [id123|Name]
+                    target_id = int(target.split('|')[0].replace('[id', ''))
+                else:
+                    target_id = int(target)
+                
+                db.get_user(target_id) # Регаем если нет
+                db.update_user(target_id, 'lvl', lvl)
+                
+                titles = {1: "Мл. Модератор", 2: "Модератор", 3: "Ст. Модератор", 4: "Администратор", 5: "Гл. Администратор"}
+                title = titles.get(lvl, "Администратор")
+                db.update_user(target_id, 'prefix', title)
+
+                self.send(user_id, f"✅ Пользователю @id{target_id} выдан уровень {lvl} ({title}).")
+                self.send(target_id, f"🎉 Вам выданы права администратора уровня {lvl}!")
+
+            except Exception as e:
+                self.send(user_id, f"❌ Ошибка: {e}")
+
+        else:
+            if not is_admin and state is None:
+                self.send(user_id, "🏠 Главное меню", Keyboards.main(is_admin))
 
 if __name__ == "__main__":
-    print(f"--- {BOT_VER} STARTED ---")
-    try:
-        bot.remove_webhook()
-    except: pass
-    bot.infinity_polling()
+    bot = AdminBot()
+    bot.run()
