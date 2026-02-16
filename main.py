@@ -10,13 +10,13 @@ import os
 
 # ================= КОНФИГУРАЦИЯ =================
 CONFIG = {
-    # Твой токен:
+    # Токен (проверь, что он от этой же группы!)
     "token": "vk1.a.wshvI2ztLe5xObZOEVxC7jvywJISUuHO2GHqm_OS40jPFA8j0NBSs_QR4G5QSfuWXRkJihdrdUiEVTIPCb3wszdQTx7miFf71BSeB28NHeSU0ErnOMz77D8Qt0SHVjYuLf7FzgA0KgSp3eRUrdQFihhjAbE5uFM9zUzvOJBZkrBwXyY0j7zNLtjpBSSgJi0xDG10EBULjT2iQ5pxkJhxpg",
     
-    # ID твоей группы:
-    "group_id": 1771275401,
+    # ИСПРАВЛЕННЫЙ ID ГРУППЫ (из твоих логов):
+    "group_id": 1771275981,
     
-    # ТВОЙ ID (Я вставил его сюда):
+    # ТВОЙ ID:
     "owner_id": 864765284,
     
     "db_file": "server_bot.db"
@@ -30,7 +30,6 @@ class Database:
         self.create_tables()
 
     def create_tables(self):
-        # Таблица пользователей
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -43,7 +42,6 @@ class Database:
                 warns INTEGER DEFAULT 0
             )
         ''')
-        # Таблица неактивов
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS inactives (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,7 +85,6 @@ class Database:
         self.cursor.execute("SELECT * FROM inactives WHERE id = ?", (inactive_id,))
         return self.cursor.fetchone()
 
-# Инициализация БД
 db = Database(CONFIG['db_file'])
 
 # ================= КЛАВИАТУРЫ =================
@@ -99,7 +96,6 @@ class Keyboards:
         kb.add_line()
         kb.add_button("📩 Отправить норму", color=VkKeyboardColor.POSITIVE)
         kb.add_button("🕓 Неактив", color=VkKeyboardColor.SECONDARY)
-        
         if is_admin:
             kb.add_line()
             kb.add_button("👑 Админ Панель", color=VkKeyboardColor.NEGATIVE)
@@ -123,7 +119,6 @@ class Keyboards:
 
     @staticmethod
     def inactive_decision(inactive_id):
-        # Кнопки под сообщением (Inline)
         kb = VkKeyboard(inline=True)
         kb.add_callback_button("✅ Одобрить", color=VkKeyboardColor.POSITIVE, payload={"type": "inactive_ok", "id": inactive_id})
         kb.add_callback_button("❌ Отказать", color=VkKeyboardColor.NEGATIVE, payload={"type": "inactive_no", "id": inactive_id})
@@ -149,93 +144,70 @@ class AdminBot:
                 attachment=attachment
             )
         except Exception as e:
-            print(f"Ошибка отправки сообщения пользователю {peer_id}: {e}")
+            print(f"Ошибка отправки: {e}")
 
     def run(self):
-        print(f"🤖 Бот запущен! Работаем в группе ID: {CONFIG['group_id']}")
-        
+        print(f"🤖 Бот запущен! Группа ID: {CONFIG['group_id']}")
         while True:
             try:
                 for event in self.longpoll.listen():
-                    # 1. Нажатие на кнопки (Callback)
                     if event.type == VkBotEventType.MESSAGE_EVENT:
                         self.handle_callback(event)
-
-                    # 2. Новое сообщение
                     elif event.type == VkBotEventType.MESSAGE_NEW:
                         if event.from_user:
                             self.handle_message(event)
             except Exception as e:
-                print(f"⚠ Ошибка соединения или API: {e}")
-                time.sleep(3) # Ждем 3 секунды и пробуем снова
+                print(f"⚠ Ошибка API (перезапуск через 3с): {e}")
+                time.sleep(3)
 
     def handle_callback(self, event):
         try:
             payload = event.object.payload
             user_id = event.obj.peer_id
-            
-            # Проверка прав
             admin_data = db.get_user(user_id)
             if admin_data[2] < 1 and user_id != CONFIG['owner_id']:
-                self.vk.messages.sendMessageEventAnswer(
-                    event_id=event.object.event_id,
-                    user_id=user_id,
-                    peer_id=user_id,
-                    event_data='{"type": "show_snackbar", "text": "❌ У вас нет прав!"}'
-                )
                 return
 
             if payload.get('type') == 'inactive_ok':
                 in_id = payload['id']
                 db.update_inactive_status(in_id, "Одобрено")
                 req_data = db.get_inactive(in_id)
-                requester_id = req_data[1]
-                
                 self.vk.messages.edit(
                     peer_id=user_id,
                     conversation_message_id=event.obj.conversation_message_id,
-                    message=f"✅ Заявка #{in_id} ОДОБРЕНА администратором @id{user_id}.",
-                    keyboard=None
+                    message=f"✅ Заявка #{in_id} ОДОБРЕНА.", keyboard=None
                 )
-                self.send(requester_id, f"✅ Ваш неактив (#{in_id}) был одобрен!")
+                self.send(req_data[1], f"✅ Ваш неактив (#{in_id}) одобрен!")
 
             elif payload.get('type') == 'inactive_no':
                 in_id = payload['id']
                 db.update_inactive_status(in_id, "Отказано")
                 req_data = db.get_inactive(in_id)
-                requester_id = req_data[1]
-
                 self.vk.messages.edit(
                     peer_id=user_id,
                     conversation_message_id=event.obj.conversation_message_id,
-                    message=f"❌ Заявка #{in_id} ОТКЛОНЕНА администратором @id{user_id}.",
-                    keyboard=None
+                    message=f"❌ Заявка #{in_id} ОТКЛОНЕНА.", keyboard=None
                 )
-                self.send(requester_id, f"❌ Ваш неактив (#{in_id}) был отклонен.")
-        except Exception as e:
-            print(f"Ошибка в callback: {e}")
+                self.send(req_data[1], f"❌ Ваш неактив (#{in_id}) отклонен.")
+        except: pass
 
     def handle_message(self, event):
         msg = event.object.message['text']
         user_id = event.object.message['from_id']
-        
         user_db = db.get_user(user_id)
         is_admin = (user_db[2] > 0) or (user_id == CONFIG['owner_id'])
         
-        # Авто-выдача создателя
         if user_id == CONFIG['owner_id'] and user_db[2] == 0:
             db.update_user(user_id, 'lvl', 5)
             db.update_user(user_id, 'prefix', 'Создатель')
-            self.send(user_id, "✨ Вы распознаны как Создатель. Права выданы.")
+            self.send(user_id, "✨ Вы Создатель. Права выданы.")
             is_admin = True
 
         state = self.states.get(user_id)
 
-        # === ГЛОБАЛЬНЫЕ КОМАНДЫ ===
         if msg == "❌ Отмена" or msg.lower() == "/cancel":
             self.states[user_id] = None
-            self.temp_data[user_id] = {}
-            self.send(user_id, "Действие отменено.", Keyboards.main(is_admin))
+            self.send(user_id, "Отменено.", Keyboards.main(is_admin))
             return
         
         if msg == "🔙 В меню":
@@ -243,168 +215,77 @@ class AdminBot:
             self.send(user_id, "Главное меню", Keyboards.main(is_admin))
             return
 
-        # === ДИАЛОГИ (Сценарии) ===
-        
-        # 1. Подача нормы (Фото)
         if state == "WAIT_NORM_PHOTO":
-            attachments = event.object.message['attachments']
-            is_photo = False
-            for att in attachments:
-                if att['type'] == 'photo':
-                    is_photo = True
-                    break
-            
-            if is_photo:
-                self.send(user_id, "✅ Отчет принят! Руководство проверит его.", Keyboards.main(is_admin))
-                
-                # Отправляем создателю уведомление (пересылаем фото)
+            if event.object.message['attachments']:
+                self.send(user_id, "✅ Отчет отправлен.", Keyboards.main(is_admin))
                 try:
-                    admin_text = f"🔔 НОВЫЙ ОТЧЕТ\n👤 От: @id{user_id}\n📝 Статус: На проверке"
-                    self.vk.messages.send(
-                        peer_id=CONFIG['owner_id'],
-                        message=admin_text,
-                        random_id=get_random_id(),
-                        forward_messages=event.object.message['id']
-                    )
-                except:
-                    pass
-                
+                    self.vk.messages.send(peer_id=CONFIG['owner_id'], message=f"🔔 НОВЫЙ ОТЧЕТ от @id{user_id}", random_id=get_random_id(), forward_messages=event.object.message['id'])
+                except: pass
                 self.states[user_id] = None
             else:
-                self.send(user_id, "❌ Прикрепите скриншот /astats! (Или нажмите Отмена)", Keyboards.cancel())
+                self.send(user_id, "❌ Пришлите фото!", Keyboards.cancel())
             return
 
-        # 2. Неактив (Даты)
         if state == "WAIT_INACTIVE_DATES":
             self.temp_data[user_id] = {'dates': msg}
             self.states[user_id] = "WAIT_INACTIVE_REASON"
-            self.send(user_id, "📝 Укажите причину неактива:", Keyboards.cancel())
+            self.send(user_id, "📝 Причина неактива:", Keyboards.cancel())
             return
 
-        # 3. Неактив (Причина)
         if state == "WAIT_INACTIVE_REASON":
-            dates = self.temp_data[user_id].get('dates', 'Не указано')
-            reason = msg
-            
-            in_id = db.add_inactive(user_id, dates, dates, reason)
-            
-            self.send(user_id, f"✅ Заявка #{in_id} отправлена на рассмотрение.", Keyboards.main(is_admin))
+            dates = self.temp_data[user_id].get('dates')
+            in_id = db.add_inactive(user_id, dates, dates, msg)
+            self.send(user_id, "✅ Заявка отправлена.", Keyboards.main(is_admin))
             self.states[user_id] = None
-            
-            # Уведомление создателю
-            admin_msg = (
-                f"💤 ЗАЯВКА НА НЕАКТИВ #{in_id}\n"
-                f"👤 От: @id{user_id}\n"
-                f"📅 Даты: {dates}\n"
-                f"💬 Причина: {reason}"
-            )
-            # Отправляем админу сообщение с кнопками Одобрить/Отказать
-            self.send(CONFIG['owner_id'], admin_msg, Keyboards.inactive_decision(in_id))
+            self.send(CONFIG['owner_id'], f"💤 ЗАЯВКА #{in_id}\n👤 @id{user_id}\n📅 {dates}\n💬 {msg}", Keyboards.inactive_decision(in_id))
             return
 
-        # 4. Смена ника
         if msg.lower().startswith("/nick "):
-            new_nick = msg[6:]
-            if len(new_nick) > 30:
-                self.send(user_id, "❌ Слишком длинный ник.")
-            else:
-                db.update_user(user_id, 'nickname', new_nick)
-                self.send(user_id, f"✅ Ваш ник изменен на: {new_nick}")
+            db.update_user(user_id, 'nickname', msg[6:])
+            self.send(user_id, f"✅ Ник: {msg[6:]}")
             return
-
-        # === МЕНЮ И КНОПКИ ===
 
         if msg == "📜 Моя статистика":
-            reg_dt = user_db[4]
-            try:
-                days = (datetime.datetime.now() - datetime.datetime.strptime(reg_dt, "%d.%m.%Y")).days
-            except: days = 0
-
-            text = (
-                f"📊 ADMIN STATISTICS\n"
-                f"➖➖➖➖➖➖➖➖➖➖\n"
-                f"👤 Ник: {user_db[1]}\n"
-                f"🆔 ID: {user_id}\n"
-                f"🔰 Должность: {user_db[3]} (Lvl {user_db[2]})\n"
-                f"📅 На посту: {days} дн. ({reg_dt})\n"
-                f"➖➖➖➖➖➖➖➖➖➖\n"
-                f"✅ Норма (дней): {user_db[5]}\n"
-                f"✉ Ответов: {user_db[6]}\n"
-                f"⚠ Выговоров: {user_db[7]}\n"
-                f"➖➖➖➖➖➖➖➖➖➖\n"
-                f"⚙ Для смены ника пиши: /nick Имя"
-            )
+            text = f"📊 СТАТИСТИКА\n👤 {user_db[1]}\n🔰 {user_db[3]}\n✅ Норма: {user_db[5]}\n✉ Ответов: {user_db[6]}"
             self.send(user_id, text)
-
+        
         elif msg == "📩 Отправить норму":
             self.states[user_id] = "WAIT_NORM_PHOTO"
-            self.send(user_id, "📸 Пожалуйста, отправьте скриншот вашей статистики (/astats).", Keyboards.cancel())
+            self.send(user_id, "📸 Жду скриншот.", Keyboards.cancel())
 
         elif msg == "🕓 Неактив":
             self.states[user_id] = "WAIT_INACTIVE_DATES"
-            self.send(user_id, "📅 Введите даты неактива (Например: 20.02 - 22.02):", Keyboards.cancel())
+            self.send(user_id, "📅 Даты (с..по):", Keyboards.cancel())
 
         elif msg == "👑 Админ Панель" and is_admin:
-            self.send(user_id, "🔒 Добро пожаловать в панель управления.", Keyboards.admin_panel())
+            self.send(user_id, "Админ панель:", Keyboards.admin_panel())
 
         elif msg == "💤 Заявки неактив" and is_admin:
             conn = sqlite3.connect(CONFIG['db_file'])
             cur = conn.cursor()
-            cur.execute("SELECT * FROM inactives WHERE status='wait' ORDER BY id DESC LIMIT 5")
+            cur.execute("SELECT * FROM inactives WHERE status='wait' LIMIT 5")
             rows = cur.fetchall()
             conn.close()
+            if rows:
+                for r in rows: self.send(user_id, f"Заявка #{r[0]}\nUser: @id{r[1]}\nПричина: {r[4]}", Keyboards.inactive_decision(r[0]))
+            else: self.send(user_id, "Нет заявок.")
 
-            if not rows:
-                self.send(user_id, "📭 Новых заявок на неактив нет.")
-            else:
-                self.send(user_id, f"Найдено {len(rows)} активных заявок:")
-                for row in rows:
-                    txt = (
-                        f"🔹 Заявка #{row[0]}\n"
-                        f"👤 User: @id{row[1]}\n"
-                        f"📅 {row[2]}\n"
-                        f"💬 {row[4]}"
-                    )
-                    self.send(user_id, txt, Keyboards.inactive_decision(row[0]))
-
-        # Команды выдачи админки
         elif msg.startswith("!setlvl") and is_admin:
-            # !setlvl @id 3
             try:
                 parts = msg.split()
-                if len(parts) < 3:
-                    self.send(user_id, "Ошибка. Формат: !setlvl [ID] [Уровень]")
-                    return
-                
-                target = parts[1]
+                target = int(parts[1]) if parts[1].isdigit() else int(parts[1].split('|')[0].replace('[id', ''))
                 lvl = int(parts[2])
-                
-                target_id = user_id 
-                if "[id" in target:
-                    target_id = int(target.split('|')[0].replace('[id', ''))
-                elif target.isdigit():
-                    target_id = int(target)
-                else:
-                    self.send(user_id, "Укажите ID через упоминание @ или цифрами.")
-                    return
-                
-                db.get_user(target_id)
-                db.update_user(target_id, 'lvl', lvl)
-                
-                titles = {1: "Мл. Модератор", 2: "Модератор", 3: "Ст. Модератор", 4: "Администратор", 5: "Гл. Администратор"}
-                title = titles.get(lvl, "Администратор")
-                db.update_user(target_id, 'prefix', title)
-
-                self.send(user_id, f"✅ Пользователю @id{target_id} выдан уровень {lvl} ({title}).")
-                self.send(target_id, f"🎉 Вам выданы права администратора уровня {lvl}!")
-
-            except Exception as e:
-                self.send(user_id, f"❌ Ошибка: {e}")
+                db.get_user(target)
+                db.update_user(target, 'lvl', lvl)
+                titles = {1:"Мл.Модер", 5:"Гл.Админ"}
+                db.update_user(target, 'prefix', titles.get(lvl, "Админ"))
+                self.send(user_id, f"✅ Выдан {lvl} уровень.")
+                self.send(target, f"🎉 Вам выдан {lvl} уровень!")
+            except: self.send(user_id, "Ошибка команды.")
 
         else:
-            if not is_admin and state is None:
-                self.send(user_id, "🏠 Главное меню", Keyboards.main(is_admin))
-
+            if not is_admin: self.send(user_id, "Меню", Keyboards.main(is_admin))
+            
 if __name__ == "__main__":
     bot = AdminBot()
     bot.run()
