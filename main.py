@@ -6,79 +6,74 @@ import time
 import threading
 import logging
 import random
+import shutil
 
-# ================= КОНФИГ "МОЩЬ" =================
+# ================= КОНФИГ =================
 TOKEN = "8342888953:AAFSTtk4Bj527mxjljOr4jvGYjZ6NHq2v6M"
+DEVELOPER_NAME = "MAHIRO OYAMA"
+DEVELOPER_URL = "https://t.me/mahiro_oyama" # Ссылка на профиль (можешь поменять)
 
-# Папка для временных файлов
-DOWNLOAD_PATH = "downloads"
-if not os.path.exists(DOWNLOAD_PATH):
-    os.makedirs(DOWNLOAD_PATH)
+# Папка для загрузок
+DOWNLOAD_PATH = "fast_downloads"
+# Очищаем папку при запуске, чтобы удалить старый мусор
+if os.path.exists(DOWNLOAD_PATH):
+    shutil.rmtree(DOWNLOAD_PATH)
+os.makedirs(DOWNLOAD_PATH)
 
-# Настройка логов
+# Логи
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 bot = telebot.TeleBot(TOKEN)
 
-# Лимит телеграма для ботов - 50 МБ (байт)
-MAX_FILE_SIZE = 50 * 1024 * 1024 
+# Лимит (50 МБ), но мы стараемся качать файлы меньше
+MAX_FILE_SIZE = 49 * 1024 * 1024 
 
-# ================= КРАСИВЫЕ ТЕКСТЫ =================
+# ================= ТЕКСТЫ =================
 WELCOME_TEXT = (
-    "🚀 <b>ULTIMATE DOWNLOADER BOT</b>\n\n"
-    "Я — машина для скачивания контента. Мне не важно, откуда ссылка.\n"
-    "Просто кидай её сюда, и я достану видео в лучшем качестве.\n\n"
-    "✅ <b>Поддерживаю:</b>\n"
-    "🔴 YouTube (Video, Shorts)\n"
-    "⚫ TikTok (No Watermark)\n"
-    "🔵 VK Видео / Clips\n"
-    "🟠 RuTube\n"
-    "📸 Instagram (Reels)\n"
-    "И еще 1000+ сайтов...\n\n"
-    "👇 <i>Жду твою ссылку...</i>"
+    "🚀 <b>FAST DOWNLOADER</b>\n"
+    "<i>By MAHIRO OYAMA</i>\n\n"
+    "Я помогу тебе смотреть YouTube без тормозов прямо здесь.\n"
+    "Кидай ссылку на:\n"
+    "🔹 <b>YouTube</b> (обхожу замедление)\n"
+    "🔹 <b>TikTok</b> (без водяных знаков)\n"
+    "🔹 <b>Shorts / Reels</b>\n\n"
+    "⚡️ <i>Отправь ссылку, и я скачаю это максимально быстро.</i>"
 )
 
-PROCESSING_MSGS = [
-    "🚀 Запускаю двигатели...",
-    "🛰 Устанавливаю соединение...",
-    "⚡ Взламываю пентагон (шутка)...",
-    "📥 Выкачиваю байты...",
-    "💎 Полирую пиксели..."
-]
-
-# ================= ЛОГИКА СКАЧИВАНИЯ (ЯДРО) =================
+# ================= ЛОГИКА СКАЧИВАНИЯ =================
 def download_video_task(url, chat_id, message_id):
-    """Функция выполняется в отдельном потоке"""
     file_path = None
     try:
-        # 1. Меняем статус на "Скачивание"
+        # 1. Быстрый ответ
         bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
-            text=f"⏳ <b>{random.choice(PROCESSING_MSGS)}</b>\n<i>Подождите, идет магия...</i>",
+            text=f"⚡ <b>Загрузка...</b>\n<i>Качаю в Telegram для обхода замедления.</i>",
             parse_mode='HTML'
         )
 
-        # 2. Настройка yt-dlp (МОЩНЫЕ НАСТРОЙКИ)
+        # 2. Настройки YT-DLP для СКОРОСТИ
+        # Мы берем формат b (best), но ограничиваем высоту до 720p или 480p.
+        # Это критически важно для скорости на слабом хостинге.
         ydl_opts = {
-            'format': 'best[ext=mp4]/best', # Лучшее качество в MP4
-            'outtmpl': f'{DOWNLOAD_PATH}/%(id)s_%(title).50s.%(ext)s', # Имя файла
-            'noplaylist': True, # Не качать плейлисты целиком
-            'max_filesize': MAX_FILE_SIZE, # Не качать если больше 50мб (сразу отбой)
+            'format': 'best[ext=mp4][height<=?720]/best[ext=mp4]/best', # Приоритет 720p MP4
+            'outtmpl': f'{DOWNLOAD_PATH}/%(id)s.%(ext)s',
+            'noplaylist': True,
+            'max_filesize': MAX_FILE_SIZE,
             'quiet': True,
             'no_warnings': True,
-            # Маскировка под браузер (чтобы Ютуб не банил)
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'nocheckcertificate': True,
+            # Маскировка под iPhone (часто быстрее отдает видео)
+            'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1',
+            # Многопоточная загрузка (ускоряет YouTube)
+            'concurrent_fragment_downloads': 4,
         }
 
         info_dict = None
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Сначала получаем инфу
+            # Получаем инфу и качаем сразу
             info_dict = ydl.extract_info(url, download=True)
             
-            # Определяем путь к скачанному файлу
             if 'entries' in info_dict:
-                # Если это плейлист (иногда бывает), берем первый
                 video_info = info_dict['entries'][0]
             else:
                 video_info = info_dict
@@ -86,62 +81,74 @@ def download_video_task(url, chat_id, message_id):
             filename = ydl.prepare_filename(video_info)
             file_path = filename
 
-        # 3. Проверяем файл перед отправкой
+        # 3. Проверка файла
         if not os.path.exists(file_path):
-            raise Exception("Файл не найден после скачивания")
+            raise Exception("Файл не создался")
 
         file_size = os.path.getsize(file_path)
+        
+        # Если файл больше 50 МБ
         if file_size > MAX_FILE_SIZE:
             bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=f"❌ <b>Файл слишком большой!</b>\nTelegram запрещает ботам отправлять файлы больше 50 МБ.\nРазмер этого видео: {round(file_size/1024/1024, 1)} МБ.",
+                text=f"⚠️ <b>Видео слишком длинное/тяжелое!</b>\nTelegram не дает ботам грузить >50 МБ.\nПопробуй видео покороче.",
                 parse_mode='HTML'
             )
             os.remove(file_path)
             return
 
-        # 4. Отправляем в Телеграм
-        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="📤 <b>Загружаю в Telegram...</b>", parse_mode='HTML')
+        # 4. Отправка видео
+        bot.edit_message_text(chat_id, message_id, "📤 <b>Отправляю...</b>", parse_mode='HTML')
         
         with open(file_path, 'rb') as video:
-            # Получаем название и автора для подписи
-            caption = f"🎥 <b>{video_info.get('title', 'Video')}</b>\n👤 {video_info.get('uploader', 'Unknown')}"
+            title = video_info.get('title', 'Video')
+            author = video_info.get('uploader', 'Unknown')
+            # Ссылка на профиль автора видео
+            webpage_url = video_info.get('webpage_url', url)
+
+            caption = (
+                f"🎬 <a href='{webpage_url}'>{title}</a>\n"
+                f"👤 <b>{author}</b>\n\n"
+                f"🤖 Скачано через бота от {DEVELOPER_NAME}"
+            )
             
             bot.send_video(
                 chat_id, 
                 video, 
-                caption=caption[:1024], # Обрезаем если слишком длинное
+                caption=caption, 
                 parse_mode='HTML',
-                supports_streaming=True
+                supports_streaming=True # Позволяет смотреть сразу, не дожидаясь полной загрузки
             )
 
-        # 5. Успех - удаляем сообщение о загрузке
+        # 5. Удаляем сервисное сообщение
         bot.delete_message(chat_id, message_id)
-        logging.info(f"Success: {url}")
 
-    except yt_dlp.utils.DownloadError as e:
-        bot.edit_message_text(chat_id, message_id, text=f"❌ <b>Ошибка при скачивании:</b>\nНеверная ссылка или доступ закрыт.", parse_mode='HTML')
-        logging.error(f"DL Error: {e}")
     except Exception as e:
-        bot.edit_message_text(chat_id, message_id, text=f"❌ <b>Системная ошибка:</b>\n{str(e)}", parse_mode='HTML')
-        logging.error(f"Global Error: {e}")
-    finally:
-        # 6. Уборка мусора (ОБЯЗАТЕЛЬНО)
-        if file_path and os.path.exists(file_path):
-            try:
-                os.remove(file_path)
-            except:
-                pass
+        err_msg = str(e)
+        if "File is larger than" in err_msg:
+            text = "❌ Видео слишком большое для Telegram."
+        elif "Sign in" in err_msg:
+            text = "❌ YouTube требует вход (18+ или защита). Не могу скачать."
+        else:
+            text = "❌ Не удалось скачать. Ссылка нерабочая или хостинг блокирует."
+            
+        bot.edit_message_text(chat_id, message_id, text=text)
+        logging.error(f"Error: {e}")
 
-# ================= ОБРАБОТЧИКИ БОТА =================
+    finally:
+        # Всегда удаляем файл после попытки
+        if file_path and os.path.exists(file_path):
+            try: os.remove(file_path)
+            except: pass
+
+# ================= ОБРАБОТЧИКИ =================
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    # Клавиатура
     markup = types.InlineKeyboardMarkup()
-    btn1 = types.InlineKeyboardButton("👨‍💻 Разработчик", url="https://t.me/durov") # Поставь свою ссылку
-    markup.add(btn1)
+    btn = types.InlineKeyboardButton(f"👑 {DEVELOPER_NAME}", url=DEVELOPER_URL)
+    markup.add(btn)
     
     bot.send_message(
         message.chat.id, 
@@ -154,27 +161,25 @@ def send_welcome(message):
 def handle_text(message):
     url = message.text.strip()
     
-    # Простейшая проверка на ссылку
-    if not (url.startswith("http://") or url.startswith("https://")):
-        bot.send_message(message.chat.id, "🤨 <b>Это не ссылка!</b>\nПришли мне ссылку на TikTok, YouTube или RuTube.", parse_mode='HTML')
+    if not (url.startswith("http://") or url.startswith("https://") or "youtu" in url or "tiktok" in url):
+        # Игнорируем обычный текст, чтобы не спамить
         return
 
-    # Отправляем сообщение "Ожидайте"
-    msg = bot.send_message(message.chat.id, "🔎 <b>Анализирую ссылку...</b>", parse_mode='HTML')
+    # Мгновенная реакция
+    msg = bot.send_message(message.chat.id, "🚀 <b>Связываюсь с сервером...</b>", parse_mode='HTML')
     
-    # Запускаем поток, чтобы бот не тормозил
+    # Запуск в потоке
     threading.Thread(
         target=download_video_task, 
         args=(url, message.chat.id, msg.message_id),
         daemon=True
     ).start()
 
-# ================= ЗАПУСК =================
+# ================= START =================
 if __name__ == "__main__":
-    logging.info("🚀 BOT STARTED SUCCESSFULLY")
-    while True:
-        try:
-            bot.infinity_polling(timeout=10, long_polling_timeout=5)
-        except Exception as e:
-            logging.error(f"Bot crashed: {e}")
-            time.sleep(5)
+    # Чистим старые вебхуки если были
+    try: bot.remove_webhook()
+    except: pass
+    
+    logging.info(f"Bot by {DEVELOPER_NAME} started!")
+    bot.infinity_polling()
