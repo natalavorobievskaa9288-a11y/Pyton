@@ -10,19 +10,19 @@ import os
 
 # ================= КОНФИГУРАЦИЯ =================
 CONFIG = {
-    # Токен (проверь, что он от этой же группы!)
-    "token": "vk1.a.wshvI2ztLe5xObZOEVxC7jvywJISUuHO2GHqm_OS40jPFA8j0NBSs_QR4G5QSfuWXRkJihdrdUiEVTIPCb3wszdQTx7miFf71BSeB28NHeSU0ErnOMz77D8Qt0SHVjYuLf7FzgA0KgSp3eRUrdQFihhjAbE5uFM9zUzvOJBZkrBwXyY0j7zNLtjpBSSgJi0xDG10EBULjT2iQ5pxkJhxpg",
+    # Твой токен (тот, что ты скинул):
+    "token": "vk1.a.Z9pCqT1rlC8JsFxbrZMhhmvbPe764cfFlF9N1z5RG4nrLfO9E8YisGaABMzphZNjMOZ01Y4A25SAdRZnvVSO2mxmOUq2AiOsPkNmmQXH_6ghpstHBPiPjxZv-c6t8JL8JV1qbmOpFPTTSOx8_CAfsKFaMqa9_-BXqLW4LbeR2fyyncJMlHHpTsfcjLWXtZYJu1rJSUDPp4zoCoVcOpaE5A",
     
-    # ИСПРАВЛЕННЫЙ ID ГРУППЫ (из твоих логов):
-    "group_id": 1771275981,
+    # ID ТВОЕЙ НОВОЙ ГРУППЫ (club236066012):
+    "group_id": 236066012,
     
-    # ТВОЙ ID:
+    # Твой ID администратора:
     "owner_id": 864765284,
     
     "db_file": "server_bot.db"
 }
 
-# ================= МЕНЕДЖЕР БАЗЫ ДАННЫХ =================
+# ================= БАЗА ДАННЫХ =================
 class Database:
     def __init__(self, db_file):
         self.conn = sqlite3.connect(db_file, check_same_thread=False)
@@ -130,6 +130,7 @@ class AdminBot:
         print("Авторизация в ВК...")
         self.vk_session = vk_api.VkApi(token=CONFIG['token'])
         self.vk = self.vk_session.get_api()
+        # Основная точка ошибки: если здесь упадет, значит Long Poll выключен в настройках
         self.longpoll = VkBotLongPoll(self.vk_session, CONFIG['group_id'])
         self.states = {} 
         self.temp_data = {} 
@@ -147,7 +148,7 @@ class AdminBot:
             print(f"Ошибка отправки: {e}")
 
     def run(self):
-        print(f"🤖 Бот запущен! Группа ID: {CONFIG['group_id']}")
+        print(f"🤖 Бот запускается... Группа ID: {CONFIG['group_id']}")
         while True:
             try:
                 for event in self.longpoll.listen():
@@ -195,8 +196,9 @@ class AdminBot:
         msg = event.object.message['text']
         user_id = event.object.message['from_id']
         user_db = db.get_user(user_id)
-        is_admin = (user_db[2] > 0) or (user_id == CONFIG['owner_id'])
         
+        # Автовыдача админки создателю
+        is_admin = (user_db[2] > 0) or (user_id == CONFIG['owner_id'])
         if user_id == CONFIG['owner_id'] and user_db[2] == 0:
             db.update_user(user_id, 'lvl', 5)
             db.update_user(user_id, 'prefix', 'Создатель')
@@ -205,12 +207,13 @@ class AdminBot:
 
         state = self.states.get(user_id)
 
+        # Обработка команд
         if msg == "❌ Отмена" or msg.lower() == "/cancel":
             self.states[user_id] = None
             self.send(user_id, "Отменено.", Keyboards.main(is_admin))
             return
         
-        if msg == "🔙 В меню":
+        if msg == "🔙 В меню" or msg.lower() == "начать":
             self.states[user_id] = None
             self.send(user_id, "Главное меню", Keyboards.main(is_admin))
             return
@@ -237,7 +240,9 @@ class AdminBot:
             in_id = db.add_inactive(user_id, dates, dates, msg)
             self.send(user_id, "✅ Заявка отправлена.", Keyboards.main(is_admin))
             self.states[user_id] = None
-            self.send(CONFIG['owner_id'], f"💤 ЗАЯВКА #{in_id}\n👤 @id{user_id}\n📅 {dates}\n💬 {msg}", Keyboards.inactive_decision(in_id))
+            try:
+                self.send(CONFIG['owner_id'], f"💤 ЗАЯВКА #{in_id}\n👤 @id{user_id}\n📅 {dates}\n💬 {msg}", Keyboards.inactive_decision(in_id))
+            except: pass
             return
 
         if msg.lower().startswith("/nick "):
@@ -273,7 +278,12 @@ class AdminBot:
         elif msg.startswith("!setlvl") and is_admin:
             try:
                 parts = msg.split()
-                target = int(parts[1]) if parts[1].isdigit() else int(parts[1].split('|')[0].replace('[id', ''))
+                # Поддержка ссылок вида @id123
+                if '[id' in parts[1]:
+                    target = int(parts[1].split('|')[0].replace('[id', ''))
+                else:
+                    target = int(parts[1])
+                    
                 lvl = int(parts[2])
                 db.get_user(target)
                 db.update_user(target, 'lvl', lvl)
@@ -281,7 +291,7 @@ class AdminBot:
                 db.update_user(target, 'prefix', titles.get(lvl, "Админ"))
                 self.send(user_id, f"✅ Выдан {lvl} уровень.")
                 self.send(target, f"🎉 Вам выдан {lvl} уровень!")
-            except: self.send(user_id, "Ошибка команды.")
+            except: self.send(user_id, "Ошибка команды. Пиши: !setlvl ID Уровень")
 
         else:
             if not is_admin: self.send(user_id, "Меню", Keyboards.main(is_admin))
