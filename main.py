@@ -1,6 +1,6 @@
 import telebot
 from telebot import types
-import cloudscraper
+from curl_cffi import requests # Используем вместо cloudscraper
 from bs4 import BeautifulSoup
 import time
 import threading
@@ -32,33 +32,18 @@ URLS = {
 }
 
 DB_FILE = "users_v2.json"
-CHECK_INTERVAL = 120 # 2 минуты (оптимально для обхода защиты)
+CHECK_INTERVAL = 60  # Проверяем раз в минуту
 
 # Настройка логов
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 bot = telebot.TeleBot(TOKEN)
 
-# ================= СЛОЖНАЯ ЛОГИКА СЕТИ =================
-# Создаем сессию с защитой от кэширования
-scraper = cloudscraper.create_scraper(
-    browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
-)
-
-def get_random_headers():
-    """Генерирует заголовки, чтобы сервер думал, что мы реальный человек и не кэшировал страницу"""
-    return {
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Pragma': 'no-cache',
-        'Expires': '0',
-        'Upgrade-Insecure-Requests': '1',
-        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Referer': 'https://forum.blackrussia.online/'
-    }
+# ================= СЕССИЯ С ИМИТАЦИЕЙ БРАУЗЕРА =================
+# curl_cffi позволяет имитировать отпечаток браузера Chrome
+session = requests.Session()
 
 # ================= ПЕРЕМЕННЫЕ ПАМЯТИ =================
 data_lock = threading.Lock()
-# Храним полную инфу о последней теме для логов
-# format: "category": {"id": "123", "title": "Text", "time": "12:00"}
 last_scan_info = {key: {"id": None, "title": "Нет данных", "check_time": "Не проверялось"} for key in URLS.keys()}
 
 # ================= РАБОТА С БД =================
@@ -86,15 +71,19 @@ def toggle_sub(user_id, category):
     save_db(db)
     return res
 
-# ================= ПАРСЕР (HARDCORE MODE) =================
+# ================= ПАРСЕР (НОВЫЙ МЕТОД) =================
 def parse_forum_category(cat_key):
     url = URLS[cat_key]['url']
     try:
-        # Добавляем случайную задержку (0.5 - 2 сек), чтобы быть как человек
-        time.sleep(random.uniform(0.5, 2.0))
+        # Случайная задержка
+        time.sleep(random.uniform(1, 3))
         
-        # Делаем запрос с "анти-кэш" заголовками
-        response = scraper.get(url, headers=get_random_headers())
+        # Запрос с имитацией Chrome 110 (обходит TLS Fingerprint)
+        response = session.get(
+            url, 
+            impersonate="chrome110", 
+            timeout=15
+        )
         
         if response.status_code != 200:
             logging.error(f"FAIL {cat_key}: Code {response.status_code}")
@@ -102,37 +91,38 @@ def parse_forum_category(cat_key):
 
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Находим ВСЕ темы
+        # Находим темы
         threads = soup.select('.structItem--thread')
         
         if not threads:
-            logging.warning(f"Пустой список тем в {cat_key}. Возможно, защита усилилась.")
+            # Иногда защита выдает заглушку, проверяем это
+            if "Just a moment" in response.text or "DDoS-Guard" in response.text:
+                logging.warning(f"DETECTED PROTECTION on {cat_key}")
+            else:
+                logging.warning(f"Пустой список тем в {cat_key}. Возможно, верстка изменилась.")
             return None
 
-        # --- ЛОГИКА ФИЛЬТРАЦИИ ---
         found_thread = None
         
         for thread in threads:
             classes = thread.get('class', [])
             
-            # ГЛАВНОЕ: Пропускаем закрепленные темы (Важно/На рассмотрении)
-            # Они имеют класс 'structItem-status--sticky'
-            if 'structItem-status--sticky' in classes:
-                continue
-            
-            # Пропускаем удаленные темы (на всякий случай)
-            if 'is-deleted' in classes:
+            # Пропускаем закрепы и удаленные
+            if 'structItem-status--sticky' in classes or 'is-deleted' in classes:
                 continue
 
-            # Если мы здесь - значит это ПЕРВАЯ ОБЫЧНАЯ ТЕМА
             title_tag = thread.select_one('.structItem-title a')
             author_tag = thread.select_one('.username')
             
-            # Получаем префикс (Ожидание, Одобрено и т.д.)
+            # Получаем префикс
             prefix_tag = thread.select_one('.label')
             prefix = prefix_tag.text.strip() if prefix_tag else "Без префикса"
             
             if title_tag:
+                # Дополнительная проверка: иногда форум кидает "Переадресацию" как тему
+                if "redirect" in title_tag['href']:
+                    continue
+
                 found_thread = {
                     "id": link_to_id(title_tag['href']),
                     "title": title_tag.text.strip(),
@@ -140,7 +130,7 @@ def parse_forum_category(cat_key):
                     "author": author_tag.text.strip() if author_tag else "Аноним",
                     "prefix": prefix
                 }
-                break # Нашли самую свежую обычную тему, выходим из цикла
+                break 
 
         return found_thread
 
@@ -149,7 +139,6 @@ def parse_forum_category(cat_key):
         return None
 
 def link_to_id(link):
-    # Превращает /threads/name.12345/ в 12345
     try:
         return link.split('.')[-1].replace('/', '')
     except:
@@ -157,9 +146,9 @@ def link_to_id(link):
 
 # ================= ФОНОВЫЙ ПРОЦЕСС =================
 def monitor_loop():
-    logging.info("🚀 Мониторинг запущен в усиленном режиме")
+    logging.info("🚀 Мониторинг запущен (CURL_CFFI mode)")
     
-    # Инициализация (первый прогон без уведомлений)
+    # Первый прогон
     for key in URLS:
         data = parse_forum_category(key)
         if data:
@@ -169,6 +158,8 @@ def monitor_loop():
                 "check_time": time.strftime("%H:%M:%S")
             }
             logging.info(f"Init {key}: {data['title']}")
+        else:
+             logging.info(f"Init {key}: Не удалось получить данные")
     
     while True:
         try:
@@ -176,15 +167,11 @@ def monitor_loop():
             
             for key, info in URLS.items():
                 data = parse_forum_category(key)
-                
-                # Обновляем время проверки для логов
                 current_time = time.strftime("%H:%M:%S")
                 
                 if data:
-                    # Если ID изменился по сравнению с памятью
                     prev_id = last_scan_info[key].get('id')
                     
-                    # Обновляем инфу в памяти (для кнопки Логи)
                     last_scan_info[key] = {
                         "id": data['id'],
                         "title": data['title'],
@@ -202,18 +189,13 @@ def monitor_loop():
                             f"📝 <a href='{data['link']}'>{data['title']}</a>"
                         )
                         
-                        # Рассылка
-                        count = 0
                         for user_id, subs in db.items():
                             if key in subs:
                                 try:
                                     bot.send_message(user_id, msg, parse_mode='HTML')
-                                    count += 1
                                 except: pass
-                        logging.info(f"Отправлено {count} людям")
                 else:
-                    # Если парсер вернул None (ошибка), пишем в лог статус
-                    last_scan_info[key]['check_time'] = f"{current_time} (Ошибка доступа)"
+                    last_scan_info[key]['check_time'] = f"{current_time} (Защита/Ошибка)"
 
             time.sleep(CHECK_INTERVAL)
             
@@ -221,29 +203,23 @@ def monitor_loop():
             logging.error(f"Global Loop Error: {e}")
             time.sleep(60)
 
-# ================= МЕНЮ И ЛОГИ =================
+# ================= МЕНЮ =================
 def main_menu(user_id):
     markup = types.InlineKeyboardMarkup(row_width=1)
-    subs = get_user_subs(user_id) # Получаем подписки юзера
-    db = load_db() # Получаем всю базу
+    subs = get_user_subs(user_id)
     
-    # Кнопки разделов
     for key, data in URLS.items():
         status = "✅" if key in subs else "❌"
         markup.add(types.InlineKeyboardButton(f"{status} {data['name']}", callback_data=f"sub_{key}"))
     
-    # Кнопка ЛОГОВ (Для проверки работы)
     markup.add(types.InlineKeyboardButton("📊 Статус / Логи бота", callback_data="check_logs"))
-    
     return markup
 
 @bot.message_handler(commands=['start'])
 def start_h(m):
     bot.send_message(
         m.chat.id, 
-        "🤖 <b>Бот-Мониторинг v2.0 (Hardcore)</b>\n\n"
-        "Я игнорирую закрепленные темы и ищу только свежие.\n"
-        "Жми кнопку <b>Логи</b>, чтобы проверить, что я вижу прямо сейчас.",
+        "🤖 <b>Мониторинг BlackRussia</b>\nЖми кнопки для подписки на разделы.",
         reply_markup=main_menu(m.chat.id),
         parse_mode='HTML'
     )
@@ -255,20 +231,14 @@ def get_user_subs(uid):
 @bot.callback_query_handler(func=lambda call: True)
 def callback_h(call):
     if call.data == "check_logs":
-        # Формируем отчет о том, что бот видит последним
         report = "📊 <b>ТЕКУЩИЙ СТАТУС БОТА:</b>\n\n"
         for key, info in last_scan_info.items():
             name = URLS[key]['name']
             last_t = info['title']
             check_t = info['check_time']
-            # Обрезаем название, если длинное
-            if len(last_t) > 20: last_t = last_t[:20] + "..."
+            if len(last_t) > 25: last_t = last_t[:25] + "..."
             
-            report += f"🔹 <b>{name}</b>\n"
-            report += f"🕒 Проверка: {check_t}\n"
-            report += f"👁 Видит: {last_t}\n\n"
-        
-        report += f"<i>Время на сервере: {time.strftime('%H:%M:%S')}</i>"
+            report += f"🔹 <b>{name}</b>\n🕒 {check_t}\n👁 {last_t}\n\n"
         
         bot.send_message(call.message.chat.id, report, parse_mode='HTML')
         bot.answer_callback_query(call.id)
