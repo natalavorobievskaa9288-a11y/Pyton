@@ -1,4 +1,2 @@
 pyTelegramBotAPI
-beautifulsoup4
-curl_cffi
-fake-useragent
+yt-dlp
