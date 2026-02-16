@@ -6,21 +6,60 @@ from vk_api.utils import get_random_id
 import sqlite3
 import datetime
 import time
-import os
 
 # ================= КОНФИГУРАЦИЯ =================
 CONFIG = {
-    # Твой токен (тот, что ты скинул):
+    # Твой токен:
     "token": "vk1.a.Z9pCqT1rlC8JsFxbrZMhhmvbPe764cfFlF9N1z5RG4nrLfO9E8YisGaABMzphZNjMOZ01Y4A25SAdRZnvVSO2mxmOUq2AiOsPkNmmQXH_6ghpstHBPiPjxZv-c6t8JL8JV1qbmOpFPTTSOx8_CAfsKFaMqa9_-BXqLW4LbeR2fyyncJMlHHpTsfcjLWXtZYJu1rJSUDPp4zoCoVcOpaE5A",
     
-    # ID ТВОЕЙ НОВОЙ ГРУППЫ (club236066012):
+    # ID ТВОЕЙ ГРУППЫ:
     "group_id": 236066012,
     
-    # Твой ID администратора:
+    # Твой ID (Куда будут приходить отчеты):
     "owner_id": 864765284,
     
     "db_file": "server_bot.db"
 }
+
+# ================= ШАБЛОНЫ СООБЩЕНИЙ =================
+TEMPLATE_NORMA = """Скопируй шаблон ниже, заполни и отправь:
+
+1 - NickName:
+2 - Уровень администратора:
+3 - Должность:
+4 - Дата отчёта:
+5 - /astats:"""
+
+TEMPLATE_EXTRA = """Скопируй шаблон ниже, заполни и отправь:
+
+1. NickName:
+2. Уровень админ-прав:
+3. Должность:
+4. За какой день подается отчёт:
+5. Какая работа была проделана:
+6. Скриншоты проделанной работы:"""
+
+TEMPLATE_INACTIVE = """Скопируй шаблон ниже, заполни и отправь:
+
+1. Ваш NickName:
+2. Уровень админ прав:
+3. Занимаемая должность:
+4. Подменяющее лицо:
+5. Кто из главной администрации предупрежден:
+6. Дата неактива (какие дни):
+7. Причина неактива:"""
+
+WELCOME_TEXT = """👋 Добро пожаловать в бота Admin Assistant!
+
+Я помогаю сдавать отчеты и брать неактивы.
+Используй кнопки внизу для управления.
+
+📌 Доступные команды:
+!nick [Ник] — Установить свой ник
+!setlvl [ID] [LVL] — Выдать админку (только для гл. админа)
+Начать — Вызов этого меню
+
+👇 Выберите действие на клавиатуре:"""
 
 # ================= БАЗА ДАННЫХ =================
 class Database:
@@ -42,16 +81,6 @@ class Database:
                 warns INTEGER DEFAULT 0
             )
         ''')
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS inactives (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                date_start TEXT,
-                date_end TEXT,
-                reason TEXT,
-                status TEXT DEFAULT 'wait' 
-            )
-        ''')
         self.conn.commit()
 
     def get_user(self, user_id):
@@ -65,25 +94,8 @@ class Database:
         return result
 
     def update_user(self, user_id, column, value):
-        if isinstance(value, str) and (value.startswith('+') or value.startswith('-')):
-             self.cursor.execute(f"UPDATE users SET {column} = {column} + ? WHERE user_id = ?", (int(value), user_id))
-        else:
-            self.cursor.execute(f"UPDATE users SET {column} = ? WHERE user_id = ?", (value, user_id))
+        self.cursor.execute(f"UPDATE users SET {column} = ? WHERE user_id = ?", (value, user_id))
         self.conn.commit()
-
-    def add_inactive(self, user_id, d_start, d_end, reason):
-        self.cursor.execute("INSERT INTO inactives (user_id, date_start, date_end, reason) VALUES (?, ?, ?, ?)", 
-                            (user_id, d_start, d_end, reason))
-        self.conn.commit()
-        return self.cursor.lastrowid
-
-    def update_inactive_status(self, inactive_id, status):
-        self.cursor.execute("UPDATE inactives SET status = ? WHERE id = ?", (status, inactive_id))
-        self.conn.commit()
-        
-    def get_inactive(self, inactive_id):
-        self.cursor.execute("SELECT * FROM inactives WHERE id = ?", (inactive_id,))
-        return self.cursor.fetchone()
 
 db = Database(CONFIG['db_file'])
 
@@ -91,24 +103,18 @@ db = Database(CONFIG['db_file'])
 class Keyboards:
     @staticmethod
     def main(is_admin=False):
+        # one_time=False ВАЖНО, чтобы кнопки не исчезали
         kb = VkKeyboard(one_time=False)
-        kb.add_button("📜 Моя статистика", color=VkKeyboardColor.PRIMARY)
+        
+        kb.add_button("📩 Норма", color=VkKeyboardColor.POSITIVE)
+        kb.add_button("📈 Доп. отчёт", color=VkKeyboardColor.PRIMARY)
         kb.add_line()
-        kb.add_button("📩 Отправить норму", color=VkKeyboardColor.POSITIVE)
         kb.add_button("🕓 Неактив", color=VkKeyboardColor.SECONDARY)
+        kb.add_button("📜 Статистика", color=VkKeyboardColor.SECONDARY)
+        
         if is_admin:
             kb.add_line()
-            kb.add_button("👑 Админ Панель", color=VkKeyboardColor.NEGATIVE)
-        return kb.get_keyboard()
-
-    @staticmethod
-    def admin_panel():
-        kb = VkKeyboard(one_time=False)
-        kb.add_button("🔍 Проверить норму", color=VkKeyboardColor.PRIMARY)
-        kb.add_button("💤 Заявки неактив", color=VkKeyboardColor.PRIMARY)
-        kb.add_line()
-        kb.add_button("⚙ Управление", color=VkKeyboardColor.SECONDARY)
-        kb.add_button("🔙 В меню", color=VkKeyboardColor.NEGATIVE)
+            kb.add_button("👑 Админ-панель", color=VkKeyboardColor.NEGATIVE)
         return kb.get_keyboard()
 
     @staticmethod
@@ -117,20 +123,12 @@ class Keyboards:
         kb.add_button("❌ Отмена", color=VkKeyboardColor.NEGATIVE)
         return kb.get_keyboard()
 
-    @staticmethod
-    def inactive_decision(inactive_id):
-        kb = VkKeyboard(inline=True)
-        kb.add_callback_button("✅ Одобрить", color=VkKeyboardColor.POSITIVE, payload={"type": "inactive_ok", "id": inactive_id})
-        kb.add_callback_button("❌ Отказать", color=VkKeyboardColor.NEGATIVE, payload={"type": "inactive_no", "id": inactive_id})
-        return kb.get_keyboard()
-
 # ================= ЛОГИКА БОТА =================
 class AdminBot:
     def __init__(self):
         print("Авторизация в ВК...")
         self.vk_session = vk_api.VkApi(token=CONFIG['token'])
         self.vk = self.vk_session.get_api()
-        # Основная точка ошибки: если здесь упадет, значит Long Poll выключен в настройках
         self.longpoll = VkBotLongPoll(self.vk_session, CONFIG['group_id'])
         self.states = {} 
         self.temp_data = {} 
@@ -148,154 +146,146 @@ class AdminBot:
             print(f"Ошибка отправки: {e}")
 
     def run(self):
-        print(f"🤖 Бот запускается... Группа ID: {CONFIG['group_id']}")
+        print(f"🤖 Бот запущен! Группа ID: {CONFIG['group_id']}")
         while True:
             try:
                 for event in self.longpoll.listen():
-                    if event.type == VkBotEventType.MESSAGE_EVENT:
-                        self.handle_callback(event)
-                    elif event.type == VkBotEventType.MESSAGE_NEW:
-                        if event.from_user:
-                            self.handle_message(event)
+                    if event.type == VkBotEventType.MESSAGE_NEW and event.from_user:
+                        self.handle_message(event)
             except Exception as e:
                 print(f"⚠ Ошибка API (перезапуск через 3с): {e}")
                 time.sleep(3)
-
-    def handle_callback(self, event):
-        try:
-            payload = event.object.payload
-            user_id = event.obj.peer_id
-            admin_data = db.get_user(user_id)
-            if admin_data[2] < 1 and user_id != CONFIG['owner_id']:
-                return
-
-            if payload.get('type') == 'inactive_ok':
-                in_id = payload['id']
-                db.update_inactive_status(in_id, "Одобрено")
-                req_data = db.get_inactive(in_id)
-                self.vk.messages.edit(
-                    peer_id=user_id,
-                    conversation_message_id=event.obj.conversation_message_id,
-                    message=f"✅ Заявка #{in_id} ОДОБРЕНА.", keyboard=None
-                )
-                self.send(req_data[1], f"✅ Ваш неактив (#{in_id}) одобрен!")
-
-            elif payload.get('type') == 'inactive_no':
-                in_id = payload['id']
-                db.update_inactive_status(in_id, "Отказано")
-                req_data = db.get_inactive(in_id)
-                self.vk.messages.edit(
-                    peer_id=user_id,
-                    conversation_message_id=event.obj.conversation_message_id,
-                    message=f"❌ Заявка #{in_id} ОТКЛОНЕНА.", keyboard=None
-                )
-                self.send(req_data[1], f"❌ Ваш неактив (#{in_id}) отклонен.")
-        except: pass
 
     def handle_message(self, event):
         msg = event.object.message['text']
         user_id = event.object.message['from_id']
         user_db = db.get_user(user_id)
         
-        # Автовыдача админки создателю
+        # Проверка прав админа
         is_admin = (user_db[2] > 0) or (user_id == CONFIG['owner_id'])
         if user_id == CONFIG['owner_id'] and user_db[2] == 0:
             db.update_user(user_id, 'lvl', 5)
             db.update_user(user_id, 'prefix', 'Создатель')
-            self.send(user_id, "✨ Вы Создатель. Права выданы.")
             is_admin = True
+            self.send(user_id, "✨ Вы распознаны как Создатель.", Keyboards.main(True))
 
         state = self.states.get(user_id)
 
-        # Обработка команд
+        # === ГЛОБАЛЬНЫЕ КОМАНДЫ ===
+        if msg.lower() in ["начать", "start", "/start", "меню"]:
+            self.states[user_id] = None
+            self.send(user_id, WELCOME_TEXT, Keyboards.main(is_admin))
+            return
+
         if msg == "❌ Отмена" or msg.lower() == "/cancel":
             self.states[user_id] = None
-            self.send(user_id, "Отменено.", Keyboards.main(is_admin))
+            self.send(user_id, "Действие отменено.", Keyboards.main(is_admin))
             return
         
-        if msg == "🔙 В меню" or msg.lower() == "начать":
-            self.states[user_id] = None
-            self.send(user_id, "Главное меню", Keyboards.main(is_admin))
+        # === ОБРАБОТКА СОСТОЯНИЙ (Диалоги) ===
+        
+        # 1. ОБРАБОТКА НОРМЫ
+        if state == "WAIT_NORMA_TEXT":
+            self.temp_data[user_id] = {'text': msg}
+            self.states[user_id] = "WAIT_NORMA_PHOTO"
+            self.send(user_id, "📸 Теперь прикрепите скриншот /astats (время в игре).", Keyboards.cancel())
             return
-
-        if state == "WAIT_NORM_PHOTO":
+            
+        if state == "WAIT_NORMA_PHOTO":
             if event.object.message['attachments']:
-                self.send(user_id, "✅ Отчет отправлен.", Keyboards.main(is_admin))
-                try:
-                    self.vk.messages.send(peer_id=CONFIG['owner_id'], message=f"🔔 НОВЫЙ ОТЧЕТ от @id{user_id}", random_id=get_random_id(), forward_messages=event.object.message['id'])
-                except: pass
+                # Пересылаем сообщение создателю
+                self.vk.messages.send(
+                    peer_id=CONFIG['owner_id'],
+                    message=f"📩 НОВАЯ НОРМА от @id{user_id}\n\n{self.temp_data[user_id]['text']}",
+                    random_id=get_random_id(),
+                    forward_messages=event.object.message['id']
+                )
+                self.send(user_id, "✅ Норма успешно отправлена руководству!", Keyboards.main(is_admin))
+                db.update_user(user_id, 'norma_days', int(user_db[5]) + 1)
                 self.states[user_id] = None
             else:
-                self.send(user_id, "❌ Пришлите фото!", Keyboards.cancel())
+                self.send(user_id, "❌ Пришлите скриншот, или нажмите Отмена.", Keyboards.cancel())
             return
 
-        if state == "WAIT_INACTIVE_DATES":
-            self.temp_data[user_id] = {'dates': msg}
-            self.states[user_id] = "WAIT_INACTIVE_REASON"
-            self.send(user_id, "📝 Причина неактива:", Keyboards.cancel())
+        # 2. ОБРАБОТКА ДОП. РЕПОРТА
+        if state == "WAIT_EXTRA_TEXT":
+            self.temp_data[user_id] = {'text': msg}
+            self.states[user_id] = "WAIT_EXTRA_PHOTO"
+            self.send(user_id, "📸 Прикрепите доказательства (скриншоты).", Keyboards.cancel())
             return
 
-        if state == "WAIT_INACTIVE_REASON":
-            dates = self.temp_data[user_id].get('dates')
-            in_id = db.add_inactive(user_id, dates, dates, msg)
-            self.send(user_id, "✅ Заявка отправлена.", Keyboards.main(is_admin))
+        if state == "WAIT_EXTRA_PHOTO":
+            if event.object.message['attachments']:
+                self.vk.messages.send(
+                    peer_id=CONFIG['owner_id'],
+                    message=f"📈 ДОП. ОТЧЕТ от @id{user_id}\n\n{self.temp_data[user_id]['text']}",
+                    random_id=get_random_id(),
+                    forward_messages=event.object.message['id']
+                )
+                self.send(user_id, "✅ Доп. отчет отправлен!", Keyboards.main(is_admin))
+                self.states[user_id] = None
+            else:
+                self.send(user_id, "❌ Пришлите скриншот работы.", Keyboards.cancel())
+            return
+
+        # 3. ОБРАБОТКА НЕАКТИВА
+        if state == "WAIT_INACTIVE_TEXT":
+            self.vk.messages.send(
+                peer_id=CONFIG['owner_id'],
+                message=f"💤 ЗАЯВЛЕНИЕ НА НЕАКТИВ от @id{user_id}\n\n{msg}",
+                random_id=get_random_id()
+            )
+            self.send(user_id, "✅ Заявка на неактив отправлена руководству.", Keyboards.main(is_admin))
             self.states[user_id] = None
-            try:
-                self.send(CONFIG['owner_id'], f"💤 ЗАЯВКА #{in_id}\n👤 @id{user_id}\n📅 {dates}\n💬 {msg}", Keyboards.inactive_decision(in_id))
-            except: pass
             return
 
-        if msg.lower().startswith("/nick "):
-            db.update_user(user_id, 'nickname', msg[6:])
-            self.send(user_id, f"✅ Ник: {msg[6:]}")
-            return
+        # === ОБРАБОТКА КНОПОК МЕНЮ ===
 
-        if msg == "📜 Моя статистика":
-            text = f"📊 СТАТИСТИКА\n👤 {user_db[1]}\n🔰 {user_db[3]}\n✅ Норма: {user_db[5]}\n✉ Ответов: {user_db[6]}"
-            self.send(user_id, text)
+        if msg == "📩 Норма":
+            self.states[user_id] = "WAIT_NORMA_TEXT"
+            self.send(user_id, TEMPLATE_NORMA, Keyboards.cancel())
         
-        elif msg == "📩 Отправить норму":
-            self.states[user_id] = "WAIT_NORM_PHOTO"
-            self.send(user_id, "📸 Жду скриншот.", Keyboards.cancel())
+        elif msg == "📈 Доп. отчёт":
+            self.states[user_id] = "WAIT_EXTRA_TEXT"
+            self.send(user_id, TEMPLATE_EXTRA, Keyboards.cancel())
 
         elif msg == "🕓 Неактив":
-            self.states[user_id] = "WAIT_INACTIVE_DATES"
-            self.send(user_id, "📅 Даты (с..по):", Keyboards.cancel())
+            self.states[user_id] = "WAIT_INACTIVE_TEXT"
+            self.send(user_id, TEMPLATE_INACTIVE, Keyboards.cancel())
 
-        elif msg == "👑 Админ Панель" and is_admin:
-            self.send(user_id, "Админ панель:", Keyboards.admin_panel())
+        elif msg == "📜 Статистика":
+            text = f"📊 ТВОЯ СТАТИСТИКА:\n👤 Ник: {user_db[1]}\n🔰 Ранг: {user_db[3]} (Lvl {user_db[2]})\n✅ Сдано норм: {user_db[5]}"
+            self.send(user_id, text, Keyboards.main(is_admin))
 
-        elif msg == "💤 Заявки неактив" and is_admin:
-            conn = sqlite3.connect(CONFIG['db_file'])
-            cur = conn.cursor()
-            cur.execute("SELECT * FROM inactives WHERE status='wait' LIMIT 5")
-            rows = cur.fetchall()
-            conn.close()
-            if rows:
-                for r in rows: self.send(user_id, f"Заявка #{r[0]}\nUser: @id{r[1]}\nПричина: {r[4]}", Keyboards.inactive_decision(r[0]))
-            else: self.send(user_id, "Нет заявок.")
+        elif msg.startswith("!nick "):
+            new_nick = msg[6:]
+            db.update_user(user_id, 'nickname', new_nick)
+            self.send(user_id, f"✅ Ваш ник обновлен: {new_nick}")
 
         elif msg.startswith("!setlvl") and is_admin:
             try:
                 parts = msg.split()
-                # Поддержка ссылок вида @id123
                 if '[id' in parts[1]:
                     target = int(parts[1].split('|')[0].replace('[id', ''))
                 else:
                     target = int(parts[1])
-                    
                 lvl = int(parts[2])
                 db.get_user(target)
                 db.update_user(target, 'lvl', lvl)
-                titles = {1:"Мл.Модер", 5:"Гл.Админ"}
-                db.update_user(target, 'prefix', titles.get(lvl, "Админ"))
-                self.send(user_id, f"✅ Выдан {lvl} уровень.")
-                self.send(target, f"🎉 Вам выдан {lvl} уровень!")
-            except: self.send(user_id, "Ошибка команды. Пиши: !setlvl ID Уровень")
+                roles = {0:"Игрок", 1:"Мл.Модер", 2:"Модер", 3:"Ст.Модер", 4:"Админ", 5:"Куратор", 6:"ЗГА", 7:"ГА"}
+                role_name = roles.get(lvl, "Спец.Админ")
+                db.update_user(target, 'prefix', role_name)
+                
+                self.send(user_id, f"✅ Игроку @id{target} выдан {lvl} уровень ({role_name}).")
+                self.send(target, f"🎉 Вам выдан администраторский уровень: {lvl} ({role_name})!", Keyboards.main(True))
+            except:
+                self.send(user_id, "Ошибка! Пиши: !setlvl [ID] [Уровень (1-7)]")
 
         else:
-            if not is_admin: self.send(user_id, "Меню", Keyboards.main(is_admin))
-            
+            # Если команда не понятна, но мы не в режиме ожидания отчета
+            if user_id not in self.states or self.states[user_id] is None:
+                self.send(user_id, "ℹ Используйте кнопки меню.", Keyboards.main(is_admin))
+
 if __name__ == "__main__":
     bot = AdminBot()
     bot.run()
