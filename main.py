@@ -8,7 +8,7 @@ import os
 import shutil
 
 # ================= КОНФИГ =================
-TOKEN = "8342888953:AAFSTtk4Bj527mxjljOr4jvGYjZ6NHq2v6M"
+TOKEN = "8463954141:AAHd96oRhacVPNF9BYHk5VuEwfKihC7jLn0"
 BOT_USERNAME = "ТвойБот" # Поменяй на имя
 
 # Папка для временных файлов (для 1080p)
